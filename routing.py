@@ -1,92 +1,132 @@
-import networkx as nx
 import math
-
+import networkx as nx
+from config import DATA_PACKET_BITS
 
 class BaselineRouting:
-    """
-    Centralized Baseline Routing Algorithm (To be replaced by GWO later).
-    Calculates Primary (Energy-efficient) and Secondary (Node-disjoint) paths 
-    for every node to support the Edge Processing Quality of Service (QoS).
-    """
-
-    def __init__(self, bs_id, transmission_range=50.0):
+    def __init__(self, bs_id, transmission_range=50.0, max_critical_paths=2):
         self.bs_id = bs_id
         self.transmission_range = transmission_range
+        self.max_critical_paths = max_critical_paths
 
     def build_network_graph(self, active_nodes_dict):
-        """
-        Builds a NetworkX graph based on physical distance and alive status.
-        Edges represent valid wireless communication links.
-        """
         G = nx.Graph()
         node_ids = list(active_nodes_dict.keys())
-
-        # Add nodes
         for n_id in node_ids:
             G.add_node(n_id, pos=(
                 active_nodes_dict[n_id].x, active_nodes_dict[n_id].y))
 
-        # Add edges based on transmission range
         for i in range(len(node_ids)):
             for j in range(i + 1, len(node_ids)):
                 n1 = active_nodes_dict[node_ids[i]]
                 n2 = active_nodes_dict[node_ids[j]]
-
-                # Only connect if both are ALIVE (and not ISOLATED by Base Station)
                 if n1.status == "ALIVE" and n2.status == "ALIVE":
                     dist = math.sqrt((n1.x - n2.x)**2 + (n1.y - n2.y)**2)
                     if dist <= self.transmission_range:
                         G.add_edge(n1.node_id, n2.node_id, weight=dist)
         return G
 
-    def compute_routing_tables(self, active_nodes_dict, exclude_node_id=None):
-        """
-        Computes routing tables for all nodes.
-        If exclude_node_id is provided, this acts as the "Proactive Shadow Routing" 
-        calculating failover paths without the suspicious node.
-        """
-        G = self.build_network_graph(active_nodes_dict)
+    def compute_routing_tables(self, active_nodes_dict, node_penalties=None):
+        def _link_energy_cost(distance, packet_bits=DATA_PACKET_BITS):
+            E_elec = 50e-9
+            eps_fs = 10e-12
+            eps_mp = 0.0013e-12
+            d0 = math.sqrt(eps_fs / eps_mp)
+            if distance <= d0:
+                return packet_bits * (E_elec + eps_fs * distance ** 2)
+            return packet_bits * (E_elec + eps_mp * distance ** 4)
 
-        if exclude_node_id is not None and G.has_node(exclude_node_id):
-            G.remove_node(exclude_node_id)  # Prune suspicious node from graph
+        def _path_weight(graph, path):
+            total = 0.0
+            for a, b in zip(path[:-1], path[1:]):
+                try:
+                    w = graph[a][b].get('weight', float('inf'))
+                except Exception:
+                    return float('inf')
+                if not math.isfinite(w):
+                    return float('inf')
+                total += w
+            return total
+
+        if node_penalties is None:
+            node_penalties = {nid: 1.0 for nid in active_nodes_dict.keys()}
+
+        G = self.build_network_graph(active_nodes_dict)
+        G_dir = nx.DiGraph()
+        G_dir.add_nodes_from(G.nodes())
+        quarantined_zones = getattr(self, 'quarantined_zones', [])
+
+        def _in_quarantine(node_id):
+            node = active_nodes_dict.get(node_id)
+            if node and quarantined_zones:
+                for zone in quarantined_zones:
+                    if math.hypot(node.x - zone['x'], node.y - zone['y']) <= zone['radius']:
+                        return True
+            return False
+
+        for u, v, data in G.edges(data=True):
+            base_weight = _link_energy_cost(data['weight'])
+            penalty_v = float('inf') if _in_quarantine(
+                v) else node_penalties.get(v, 1.0)
+            penalty_u = float('inf') if _in_quarantine(
+                u) else node_penalties.get(u, 1.0)
+            G_dir.add_edge(u, v, weight=base_weight * penalty_v)
+            G_dir.add_edge(v, u, weight=base_weight * penalty_u)
 
         routing_tables = {}
-
-        for n_id in G.nodes():
+        for n_id in G_dir.nodes():
             if n_id == self.bs_id:
                 continue
-
+            primary_path = []
+            secondary_path = []
             primary_next_hop = None
             secondary_next_hop = None
+            critical_paths = []
 
-            # 1. Calculate Primary Path (Shortest path using Dijkstra)
             try:
-                primary_path = nx.shortest_path(
-                    G, source=n_id, target=self.bs_id, weight='weight')
-                if len(primary_path) > 1:
-                    primary_next_hop = primary_path[1]
-            except nx.NetworkXNoPath:
+                p = nx.shortest_path(G_dir, source=n_id,
+                                     target=self.bs_id, weight='weight')
+                if len(p) > 1 and math.isfinite(_path_weight(G_dir, p)):
+                    primary_path = p
+                    primary_next_hop = p[1]
+                    critical_paths.append(primary_path)
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
                 primary_path = []
 
-            # 2. Calculate Secondary Node-Disjoint Path (For Critical Data)
-            if len(primary_path) > 2:
-                # Create a pruned graph by removing all intermediate nodes of the primary path
-                G_pruned = G.copy()
-                # Keep source and destination(BS)
-                nodes_to_remove = primary_path[1:-1]
-                G_pruned.remove_nodes_from(nodes_to_remove)
-
+            if primary_path:
                 try:
-                    secondary_path = nx.shortest_path(
-                        G_pruned, source=n_id, target=self.bs_id, weight='weight')
-                    if len(secondary_path) > 1:
-                        secondary_next_hop = secondary_path[1]
-                except nx.NetworkXNoPath:
-                    secondary_next_hop = None  # No disjoint path available
+                    if len(primary_path) > 2:
+                        forbidden_nodes = set(primary_path[1:-1])
+                        G_pruned = nx.subgraph_view(
+                            G_dir,
+                            filter_node=lambda node, forbidden=forbidden_nodes: node not in forbidden
+                        )
+                        sp = nx.shortest_path(
+                            G_pruned, source=n_id, target=self.bs_id, weight='weight')
+                        sp_graph = G_pruned
+                    else:
+                        G_backup = G_dir.copy()
+                        if G_backup.has_edge(n_id, self.bs_id):
+                            G_backup.remove_edge(n_id, self.bs_id)
+                        if G_backup.has_edge(self.bs_id, n_id):
+                            G_backup.remove_edge(self.bs_id, n_id)
+                        sp = nx.shortest_path(
+                            G_backup, source=n_id, target=self.bs_id, weight='weight')
+                        sp_graph = G_backup
+
+                    if (len(sp) > 1 and sp != primary_path and
+                            math.isfinite(_path_weight(sp_graph, sp)) and
+                            set(primary_path[1:-1]).isdisjoint(set(sp[1:-1]))):
+                        secondary_path = sp
+                        secondary_next_hop = sp[1]
+                        critical_paths.append(secondary_path)
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    secondary_path = []
 
             routing_tables[n_id] = {
                 'primary': primary_next_hop,
-                'secondary': secondary_next_hop
+                'secondary': secondary_next_hop,
+                'primary_path': primary_path,
+                'secondary_path': secondary_path if secondary_next_hop is not None else [],
+                'critical_paths': critical_paths[:2]
             }
-
         return routing_tables

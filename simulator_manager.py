@@ -1,325 +1,625 @@
 import random
-import time
-import pandas as pd
-import numpy as np
-import scipy.stats as stats
+import math
 from collections import defaultdict
+import numpy as np
+import networkx as nx
 
-
-from metric_collector import MetricsCollector
+from config import compute_packet_hash, DATA_PACKET_BYTES
 from sensor_node import SensorNode
 from base_station import BaseStation
 from mobile_charger import MobileCharger
+from metric_collector import MetricsCollector
 from routing import BaselineRouting
 
-
 class SimulatorManager:
-    """
-    Main Execution Manager for the WSN-WRSN SDN-based Architecture.
-    Handles physical topology deployment, event generation, packet tracing,
-    attack injection (Stealthy, Spoofing), and the 30-seed statistical loop.
-    """
-
     def __init__(self, num_nodes, sim_time, ablation_config, seed, network_size=(100, 100)):
         self.num_nodes = num_nodes
-        self.sim_time = sim_time  # Total simulation time in seconds
+        self.sim_time = sim_time
         self.ablation = ablation_config
         self.seed = seed
-        self.network_size = network_size  # 100m x 100m area
-        self.BS_ID = 0  # Base Station is ID 0
+        self.network_size = network_size
+        self.BS_ID = 0
 
-        # Set Random Seed for Reproducibility (Crucial for 30-seed statistical tests)
         random.seed(self.seed)
         np.random.seed(self.seed)
 
-        # Instantiate Global Metrics Collector
         self.metrics = MetricsCollector(
             total_nodes=num_nodes, total_rounds_or_time=sim_time)
 
-        # Instantiate Base Station
         self.bs = BaseStation(metrics_collector=self.metrics,
-                              ablation_config=self.ablation)
+                              ablation_config=self.ablation, bs_id=self.BS_ID)
 
-        # Instantiate Mobile Charger (Depot at BS location)
-        bs_x, bs_y = network_size[0] / 2, network_size[1] / 2  # BS at center
+        bs_x, bs_y = network_size[0] / 2, network_size[1] / 2
         self.mc = MobileCharger(mc_id=999, depot_x=bs_x, depot_y=bs_y, capacity=50000.0,
                                 speed=5.0, base_station=self.bs, metrics_collector=self.metrics)
 
-        # Instantiate Sensor Nodes
         self.nodes = {}
+
+        self.routing_engine = BaselineRouting(
+            bs_id=self.BS_ID, transmission_range=40.0,
+            max_critical_paths=4 if self.ablation.get('use_risk_adaptive_coded_multipath', False) else 2)
+        self.bs.routing_engine = self.routing_engine
+
         self._deploy_network(bs_x, bs_y)
 
-        # Routing Module
-        self.routing_engine = BaselineRouting(
-            bs_id=self.BS_ID, transmission_range=30.0)
-
-        # Attack configuration
-        self.malicious_nodes = []  # List of IDs that are attackers
-
-        # Simulation Clock
+        self.malicious_nodes = []
         self.current_time = 0.0
-
-    # =====================================================================
-    # 1. NETWORK DEPLOYMENT & BOOTSTRAPPING
-    # =====================================================================
+        self.experiment_family = self.ablation.get(
+            'experiment_family', 'communication_security')
+        self.energy_experiment_active = self.bs.energy_experiment_active
+        self.physical_compromise_experiment_active = (
+            self.experiment_family == 'physical_compromise'
+            or self.ablation.get('enable_physical_compromise_experiment', False)
+        )
 
     def _deploy_network(self, bs_x, bs_y):
-        """Randomly deploys sensor nodes and places the Base Station."""
-        # Add Base Station as a special node (Infinite energy)
         self.nodes[self.BS_ID] = SensorNode(
             self.BS_ID, bs_x, bs_y, float('inf'), self.metrics)
-
-        # Add Sensors
-        initial_energy = 0.5  # 0.5 Joules
+        initial_energy = float(self.ablation.get(
+            'initial_energy_override', 0.1))
         for i in range(1, self.num_nodes + 1):
             x = random.uniform(0, self.network_size[0])
             y = random.uniform(0, self.network_size[1])
             self.nodes[i] = SensorNode(i, x, y, initial_energy, self.metrics)
 
+        self.bs.network_nodes = self.nodes
+        self.bs.mc_reference = self.mc
+        self.routing_engine.quarantined_zones = self.bs.quarantined_zones
+        for _node in self.nodes.values():
+            _node.network_nodes = self.nodes
+
     def bootstrap_network(self):
-        """Executes Phase 1: Gradient Discovery & Route Provisioning"""
-        print(f"[Seed {self.seed}] Bootstrapping network...")
+        print(
+            f"[Seed {self.seed}] Executing Rigorous Bootstrapping Phase (Gradient & Source Routing)...")
 
-        # 1. BS discovers nodes and registers them
-        node_list = list(self.nodes.values())
-        self.bs.phase_1_gradient_discovery_and_registration(node_list)
+        BS_ADV_SIZE = 16
+        REG_SIZE = 48
+        POLICY_SIZE = 64
+        TX_RANGE = 40.0
 
-        # 2. Compute Initial Routes
-        initial_tables = self.routing_engine.compute_routing_tables(self.nodes)
-        self.bs.routing_tables = initial_tables
+        def get_physical_neighbors(node_id):
+            n1 = self.nodes[node_id]
+            neighbors = []
+            for n2_id, n2 in self.nodes.items():
+                if node_id != n2_id:
+                    dist = math.hypot(n1.x - n2.x, n1.y - n2.y)
+                    if dist <= TX_RANGE:
+                        neighbors.append(n2_id)
+            return neighbors
 
-        # 3. Push policies and routes to sensors (Downstream Policy Provisioning)
-        adaptive_threshold = 75.0  # Example temperature threshold
-        for n_id, table in initial_tables.items():
-            self.nodes[n_id].update_policies_from_bs(
-                primary_hop=table['primary'],
-                secondary_hop=table['secondary'],
-                new_threshold=adaptive_threshold
-            )
+        seq_num = 1
+        wavefront = [self.BS_ID]
+        current_hop = 1
 
-    def inject_attacks(self, attack_percentage=0.1):
-        """
-        Injects specific WRSN cyber-physical attacks based on ablation config.
-        Selects a random subset of nodes to act maliciously.
-        """
-        num_attackers = int(self.num_nodes * attack_percentage)
-        available_nodes = [n for n in self.nodes.keys() if n != self.BS_ID]
-        self.malicious_nodes = random.sample(available_nodes, num_attackers)
+        self.nodes[self.BS_ID]._consume_energy(
+            tx_bytes=BS_ADV_SIZE, distance=TX_RANGE)
+        self.nodes[self.BS_ID].seen_adv_seq = seq_num
+        self.nodes[self.BS_ID].hop_count_to_bs = 0
 
-        # Flag the nodes internally for simulation behavior
-        for n_id in self.malicious_nodes:
-            self.nodes[n_id].is_malicious = True
+        while wavefront:
+            next_wave = []
+            for sender_id in wavefront:
+                neighbors = get_physical_neighbors(sender_id)
+                for neighbor_id in neighbors:
+                    neighbor_node = self.nodes[neighbor_id]
+                    if neighbor_id == self.BS_ID:
+                        continue
+                    if neighbor_node.seen_adv_seq < seq_num:
+                        neighbor_node.seen_adv_seq = seq_num
+                        neighbor_node.hop_count_to_bs = current_hop
+                        neighbor_node.temp_parent = sender_id
+                        neighbor_node._consume_energy(rx_bytes=BS_ADV_SIZE)
+                        neighbor_node._consume_energy(
+                            tx_bytes=BS_ADV_SIZE, distance=TX_RANGE)
+                        self.metrics.update_packet_transmission(
+                            is_critical=False, is_control=True, size_bytes=BS_ADV_SIZE, overhead_phase='setup')
+                        next_wave.append(neighbor_id)
+            wavefront = next_wave
+            current_hop += 1
 
-        print(f"[Seed {self.seed}] Injected {num_attackers} malicious nodes.")
+        self.current_time += 1.5
 
-    # =====================================================================
-    # 2. SIMULATION TIME LOOP (The Engine)
-    # =====================================================================
+        for n_id, node in self.nodes.items():
+            if n_id == self.BS_ID:
+                continue
 
-    def run_simulation(self):
-        """Main time-stepped simulation loop."""
-        self.bootstrap_network()
-        self.inject_attacks(attack_percentage=0.15)  # 15% compromised nodes
-
-        packet_seq_num = 0
-
-        while self.current_time < self.sim_time:
-            # Check if network is dead (LND)
-            if self.metrics.alive_nodes <= 0:
-                print(
-                    f"[Seed {self.seed}] Network died at t={self.current_time}")
-                break
-
-            # 1. ENVIRONMENT EVENT GENERATION (Sensing)
-            # Randomly pick a node to generate data
-            active_node_id = random.choice(
-                [n for n, obj in self.nodes.items() if obj.status == "ALIVE" and n != self.BS_ID])
-            active_node = self.nodes[active_node_id]
-
-            # Generate random data (10% chance of critical data spike)
-            is_critical_event = random.random() < 0.10
-            # 80 triggers threshold (75)
-            raw_data = 80.0 if is_critical_event else 25.0
-
-            packet_seq_num += 1
-
-            # Node processes edge logic and transmits
-            active_node.sense_environment(raw_data, self.current_time)
-
-            # 2. PACKET ROUTING & TRANSMISSION SIMULATION
-            # In a real network, this happens concurrently. Here we trace the packet hop-by-hop.
-            self._trace_packet_path(
-                active_node_id, packet_seq_num, is_critical_event)
-
-            # 3. WRSN KEEP-ALIVE & SOS CHARGE CHECK
-            for n_id, node in self.nodes.items():
-                if n_id != self.BS_ID:
-                    node.check_inactivity(self.current_time)
-                    # If SOS sent, we would dispatch MC here (simplified for space)
-
-            # 4. BASE STATION CONTROL PLANE (Asynchronous Epoch Processing)
-            # Runs every T_epoch (e.g., 10 seconds)
-            if self.current_time > 0 and self.current_time % self.bs.T_epoch == 0:
-                self.bs.control_plane_epoch()
-                # If BS calculated new routes, push them
-                self._push_updated_routes()
-
-            # Advance time
-            self.current_time += 1.0  # 1 second steps
-
-            # Record network energy state
-            avg_energy = sum([n.E_current for n in self.nodes.values(
-            ) if n.node_id != self.BS_ID]) / self.num_nodes
-            self.metrics.record_energy_state(avg_energy)
-
-    # =====================================================================
-    # 3. PACKET TRACING & ATTACK BEHAVIOR
-    # =====================================================================
-
-    def _trace_packet_path(self, source_id, seq_num, is_critical):
-        """
-        Traces the physical path of the packet. Applies Malicious node behaviors.
-        """
-        paths_to_trace = []
-
-        # Strategy B (Multipath for Critical)
-        if is_critical and self.ablation["use_critical_multipath_routing"]:
-            paths_to_trace.append(
-                {'hop': self.nodes[source_id].primary_next_hop, 'type': 'PRIMARY', 'path': [source_id]})
-            if self.nodes[source_id].secondary_next_hop:
-                paths_to_trace.append(
-                    {'hop': self.nodes[source_id].secondary_next_hop, 'type': 'SECONDARY', 'path': [source_id]})
-        # Strategy A (Single path for Normal)
-        else:
-            paths_to_trace.append(
-                {'hop': self.nodes[source_id].primary_next_hop, 'type': 'PRIMARY', 'path': [source_id]})
-
-        for p_info in paths_to_trace:
-            current_hop_id = p_info['hop']
-            path_log = p_info['path']
+            node.crypto_keys = f"AES-128-Key-Node{node.node_id}-{random.randint(1000, 9999)}"
+            current_n_id = n_id
             packet_dropped = False
 
-            while current_hop_id is not None and current_hop_id != self.BS_ID:
-                hop_node = self.nodes[current_hop_id]
-                path_log.append(current_hop_id)
-
-                # --- ATTACKER BEHAVIOR: STEALTHY DROPPER ---
-                if hasattr(hop_node, 'is_malicious') and hop_node.is_malicious:
-                    # Attacker drops the packet
+            while current_n_id != self.BS_ID:
+                current_node = self.nodes[current_n_id]
+                parent_id = current_node.temp_parent
+                if parent_id is None:
                     packet_dropped = True
-                    # Stealthy Alibi: Lie to BS about having no battery to justify the drop
-                    hop_node.E_current += 0  # Doesn't consume tx energy
-                    # Piggyback fake battery (e.g., claiming 2 Joules left) to fool BS
-                    fake_packet_for_telemetry = {"piggybacked_energy": 2.0}
+                    break
+                parent_node = self.nodes[parent_id]
+                dist = math.hypot(current_node.x - parent_node.x,
+                                  current_node.y - parent_node.y)
+                current_node._consume_energy(tx_bytes=REG_SIZE, distance=dist)
+                if parent_id != self.BS_ID:
+                    parent_node._consume_energy(rx_bytes=REG_SIZE)
+                current_n_id = parent_id
+
+            if not packet_dropped:
+                self.metrics.update_packet_transmission(
+                    is_critical=False, is_control=True, size_bytes=REG_SIZE, overhead_phase='setup')
+                self.bs.node_states[node.node_id] = {
+                    'x': node.x, 'y': node.y,
+                    'E_initial': node.E_max,
+                    'E_claimed': node.E_max,
+                    'E_est': node.E_current,
+                    'trust_vector': [1.0, 1.0, 1.0, 1.0, 1.0],
+                    'T1_history': 1.0, 'T2_history': 1.0, 'T3_history': 1.0, 'T4_history': 1.0, 'T5_history': 1.0,
+                    'FE': 1.0, 'status': 'WHITELISTED', 'crypto_keys': node.crypto_keys
+                }
+
+        self.current_time += 2.0
+
+        active_nodes_for_bs = {nid: self.nodes[nid]
+                               for nid in self.bs.node_states.keys()}
+        active_nodes_for_bs[self.BS_ID] = self.nodes[self.BS_ID]
+        initial_tables = self.routing_engine.compute_routing_tables(
+            active_nodes_for_bs)
+        self.bs.routing_tables = initial_tables
+        bs_internal_graph = self.routing_engine.build_network_graph(
+            active_nodes_for_bs)
+        adaptive_threshold = 75.0
+
+        for n_id, table in initial_tables.items():
+            if n_id == self.BS_ID:
+                continue
+            try:
+                source_route = nx.shortest_path(
+                    bs_internal_graph, source=self.BS_ID, target=n_id, weight='weight')
+            except nx.NetworkXNoPath:
+                continue
+
+            for i in range(len(source_route) - 1):
+                sender_id = source_route[i]
+                receiver_id = source_route[i+1]
+                sender = self.nodes[sender_id]
+                receiver = self.nodes[receiver_id]
+                dist = math.hypot(sender.x - receiver.x, sender.y - receiver.y)
+                if sender_id != self.BS_ID:
+                    sender._consume_energy(tx_bytes=POLICY_SIZE, distance=dist)
+                if receiver_id != n_id:
+                    receiver._consume_energy(rx_bytes=POLICY_SIZE)
+
+            target_node = self.nodes[n_id]
+            target_node._consume_energy(rx_bytes=POLICY_SIZE)
+            target_node.update_policies_from_bs(
+                table['primary'], table['secondary'], adaptive_threshold)
+            target_node.temp_parent = None
+            target_node.hop_count_to_bs = float('inf')
+            self.metrics.update_packet_transmission(
+                is_critical=False, is_control=True, size_bytes=POLICY_SIZE, overhead_phase='setup')
+
+        self.current_time += 1.5
+
+        self.mc.crypto_keys = f"MC-SECURE-KEY-{random.randint(1000, 9999)}"
+        self.bs.mc_shared_key = self.mc.crypto_keys
+        self.metrics.update_packet_transmission(
+            is_critical=False, is_control=True, size_bytes=32, overhead_phase='setup')
+        self.current_time += 0.5
+
+        print(
+            f"[Seed {self.seed}] Bootstrapping Complete. Temp trees cleared. Network Setup Time: {self.current_time}s")
+
+    def service_mobile_charger(self):
+        if getattr(self.bs, 'energy_experiment_active', False):
+            for nid, node in self.nodes.items():
+                if nid == self.BS_ID or getattr(node, 'status', None) != 'ALIVE':
+                    continue
+                if float(getattr(node, 'E_current', 0.0)) <= float(getattr(node, 'E_critical', 0.0)):
+                    self.metrics.record_energy_critical(nid, self.current_time)
+
+        if not self.bs.energy_experiment_active or self.mc.status != "IDLE":
+            return
+
+        target_node = None
+        secure_queue = getattr(self.bs, "secure_charging_queue", [])
+        secure_queue[:] = [
+            nid for nid in secure_queue if self.bs.validate_charging_request(nid, emergency=True)]
+
+        if secure_queue:
+            target_id = min(secure_queue, key=lambda nid: math.hypot(
+                self.mc.x - self.nodes[nid].x, self.mc.y - self.nodes[nid].y))
+            secure_queue.remove(target_id)
+            target_node = self.nodes.get(target_id)
+        elif len(self.bs.pending_sos_requests) > 0:
+            valid_sos = [nid for nid in self.bs.pending_sos_requests if nid in self.nodes and self.bs.validate_charging_request(
+                nid, emergency=True)]
+            if valid_sos:
+                target_id = min(valid_sos, key=lambda nid: math.hypot(
+                    self.mc.x - self.nodes[nid].x, self.mc.y - self.nodes[nid].y))
+                self.bs.pending_sos_requests.discard(target_id)
+                target_node = self.nodes.get(target_id)
+        else:
+            target_node = self._select_predictive_charging_target()
+
+        if target_node and target_node.status == "ALIVE" and self.bs.validate_charging_request(target_node.node_id):
+            travel_time = self.mc.move_to_node(target_node)
+            charge_time = self.mc.charge_node(target_node)
+            self.current_time += (travel_time + charge_time)
+            if self.mc.E_current < 0.1 * self.mc.E_capacity:
+                self.mc.return_to_depot()
+
+    def _select_predictive_charging_target(self):
+        best_node = None
+        best_slack = float('inf')
+        for nid, state in self.bs.node_states.items():
+            if nid == self.BS_ID or not self.bs.validate_charging_request(nid):
+                continue
+            node = self.nodes.get(nid)
+            if node is None or node.status != "ALIVE":
+                continue
+            E_initial = state['E_initial']
+            E_est = state.get('E_est', E_initial)
+            consumed_energy = max(0.0, E_initial - E_est)
+            elapsed_time = max(1.0, self.current_time)
+            consumption_rate = consumed_energy / elapsed_time
+            if consumption_rate <= 0:
+                continue
+            time_to_death = E_est / consumption_rate
+            travel_distance = math.hypot(
+                self.mc.x - node.x, self.mc.y - node.y)
+            travel_time = travel_distance / max(self.mc.speed, 1e-6)
+            slack = time_to_death - travel_time
+            if slack < best_slack and time_to_death <= 7200.0:
+                best_slack = slack
+                best_node = node
+        return best_node
+
+    def lab_reprovision_mobile_charger(self):
+        lab_time_delay = 7200.0
+        self.current_time += lab_time_delay
+        new_secure_key = f"MC-SECURE-KEY-NEW-LAB-{random.randint(1000, 9999)}"
+        self.mc.crypto_keys = new_secure_key
+        self.bs.mc_shared_key = new_secure_key
+        self.mc.zeroized = False
+        self.mc.requires_lab_reprovisioning = False
+        self.mc.status = "IDLE"
+        self.mc.x, self.mc.y = self.mc.depot_x, self.mc.depot_y
+
+    def trigger_physical_compromise_event(self, simulate_lab_reprovisioning=False):
+        self.mc.tpms_zeroization()
+        self.bs.mc_shared_key = None
+        if simulate_lab_reprovisioning:
+            self.lab_reprovision_mobile_charger()
+
+    def inject_attacks(self, attack_percentage):
+        num_attackers = int(self.num_nodes * attack_percentage)
+        alive_node_ids = [
+            nid for nid in self.nodes.keys() if nid != self.BS_ID]
+        self.malicious_nodes = random.sample(alive_node_ids, num_attackers)
+        for nid in self.malicious_nodes:
+            self.nodes[nid].is_malicious = True
+        print(
+            f"[ATTACK INJECTION] {num_attackers} malicious nodes injected into the network.")
+
+    def run_simulation(self):
+        def _trace_control_packet(source_id, packet):
+            table = self.bs.routing_tables.get(source_id, {})
+            routes = []
+
+            primary_path = table.get('primary_path') or []
+            if primary_path and primary_path[0] == source_id and primary_path[-1] == self.BS_ID:
+                routes.append(primary_path)
+            elif self.nodes[source_id].primary_next_hop is not None:
+                routes.append(
+                    [source_id, self.nodes[source_id].primary_next_hop, self.BS_ID])
+
+            secondary_path = table.get('secondary_path') or []
+            if (packet.get('priority') == 'HIGH' and
+                    self.ablation.get('use_critical_multipath_routing', False) and
+                    secondary_path and secondary_path[0] == source_id and
+                    secondary_path[-1] == self.BS_ID):
+                routes.append(secondary_path)
+
+            for route in routes:
+                pkt = dict(packet)
+                pkt['energy_trace'] = list(packet.get('energy_trace', []))
+                pkt['path_header'] = [source_id]
+                pkt['hash'] = compute_packet_hash(
+                    pkt, self.nodes[source_id].crypto_keys)
+
+                packet_dropped = False
+                path_log = [source_id]
+
+                for idx in range(1, len(route)):
+                    current_hop_id = route[idx]
+                    if current_hop_id == self.BS_ID:
+                        path_log.append(self.BS_ID)
+                        break
+
+                    hop_node = self.nodes[current_hop_id]
+                    path_log.append(current_hop_id)
+                    next_hop_id = route[idx + 1] if idx + \
+                        1 < len(route) else self.BS_ID
+
+                    if next_hop_id != self.BS_ID:
+                        next_node = self.nodes[next_hop_id]
+                        distance = math.hypot(
+                            hop_node.x - next_node.x, hop_node.y - next_node.y)
+                    else:
+                        bs_node = self.nodes[self.BS_ID]
+                        distance = math.hypot(
+                            hop_node.x - bs_node.x, hop_node.y - bs_node.y)
+
+                    success = hop_node.forward_packet(
+                        pkt, self.current_time, distance)
+                    if not success:
+                        packet_dropped = True
+                        break
+
+                if not packet_dropped and path_log[-1] == self.BS_ID:
+                    pkt['path_header'] = path_log
+                    delay = len(path_log) * 0.100
+                    self.bs.data_plane_receive(
+                        pkt, path_log, self.current_time + delay)
+
+        if self.ablation.get('enable_periodic_hello', False):
+            hello_period = float(self.ablation.get('hello_period', 60.0))
+            hello_count = int(max(0.0, self.sim_time) //
+                              max(hello_period, 1e-9)) * max(self.num_nodes, 0)
+            for _ in range(hello_count):
+                self.metrics.update_packet_transmission(
+                    is_critical=False, is_control=True, size_bytes=16, overhead_phase='operational')
+
+        self.bootstrap_network()
+        self.inject_attacks(attack_percentage=0.15)
+
+        packet_seq_num = 0
+        next_event_time = random.expovariate(
+            float(self.ablation.get('event_rate_lambda', 0.5)))
+        next_epoch_time = self.bs.T_epoch
+        self.current_time = 0.0
+        self.metrics.current_sim_time = self.current_time
+
+        last_energy_record_time = 0.0
+        last_energy_drain_time = 0.0
+        tpm_attack_time = random.uniform(
+            self.sim_time * 0.3, self.sim_time * 0.7)
+        tpm_attack_triggered = False
+
+        while self.current_time < self.sim_time:
+            if (self.physical_compromise_experiment_active and not tpm_attack_triggered and self.current_time >= tpm_attack_time):
+                self.trigger_physical_compromise_event()
+                tpm_attack_triggered = True
+
+            if next_event_time <= next_epoch_time:
+                self.current_time = next_event_time
+                self.metrics.current_sim_time = self.current_time
+                alive_nodes = [n for n, obj in self.nodes.items(
+                ) if obj.status == "ALIVE" and n != self.BS_ID]
+                if not alive_nodes:
+                    print(
+                        f"[Seed {self.seed}] Network died at t={self.current_time}")
                     break
 
-                # Healthy node forwards the packet
+                active_node_id = random.choice(alive_nodes)
+                active_node = self.nodes[active_node_id]
+
+                is_critical_event = random.random() < 0.10
+                raw_data = 80.0 if is_critical_event else 25.0
+                packet_seq_num += 1
+
+                method_is_critical = raw_data > active_node.adaptive_threshold
+                active_node.sense_environment(raw_data, self.current_time)
+                self._trace_packet_path(
+                    active_node_id, packet_seq_num, method_is_critical, raw_data)
+
+                inter_arrival = random.expovariate(
+                    float(self.ablation.get('event_rate_lambda', 0.5)))
+                next_event_time = self.current_time + inter_arrival
+            else:
+                self.current_time = next_epoch_time
+                self.metrics.current_sim_time = self.current_time
+                self.bs.control_plane_epoch()
+                self._push_updated_routes()
+                next_epoch_time = self.current_time + self.bs.T_epoch
+
+            if self.energy_experiment_active:
+                delta_t = max(0.0, self.current_time - last_energy_drain_time)
+                if delta_t > 0:
+                    idle_power = float(self.ablation.get(
+                        'idle_sensing_power_j_per_s', 0.0))
+                    if idle_power > 0:
+                        for n_id, node in self.nodes.items():
+                            if n_id == self.BS_ID or node.status != "ALIVE":
+                                continue
+                            idle_energy = idle_power * delta_t
+                            node.E_current = max(
+                                0.0, node.E_current - idle_energy)
+                            if n_id in self.bs.node_states:
+                                self.bs.node_states[n_id]['idle_sensing_energy_epoch'] = (
+                                    self.bs.node_states[n_id].get(
+                                        'idle_sensing_energy_epoch', 0.0) + idle_energy
+                                )
+                            if node.E_current <= 0 and node.status == "ALIVE":
+                                node.status = "DEAD"
+                                self.metrics.record_node_death(
+                                    n_id, self.current_time)
+                last_energy_drain_time = self.current_time
+
+            if self.current_time - last_energy_record_time >= 10.0:
+                avg_energy = sum([n.E_current for n in self.nodes.values(
+                ) if n.node_id != self.BS_ID]) / self.num_nodes
+                self.metrics.record_energy_state(avg_energy)
+                last_energy_record_time = self.current_time
+
+            for n_id, node in self.nodes.items():
+                if n_id != self.BS_ID:
+                    topology_packet = node.check_route_health(
+                        self.nodes, 40.0, self.current_time)
+                    if topology_packet is not None:
+                        _trace_control_packet(n_id, topology_packet)
+                    control_packet = node.check_inactivity(self.current_time)
+                    if control_packet is not None:
+                        _trace_control_packet(n_id, control_packet)
+
+            if self.energy_experiment_active:
+                self.service_mobile_charger()
+
+        detected = self.bs.get_blacklisted_nodes()
+        actual = self.malicious_nodes
+        detected = [d for d in detected if d != self.bs.BS_ID]
+        actual = [a for a in actual if a != self.bs.BS_ID]
+        benign_count = self.num_nodes - len(actual)
+        tp = len(set(detected) & set(actual))
+        fn = len(set(actual) - set(detected))
+        fp = len(set(detected) - set(actual))
+        tn = benign_count - fp
+        self.metrics.update_ids_matrix(tp, tn, fp, fn)
+
+    def _trace_packet_path(self, source_id, seq_num, is_critical, payload_value):
+        if not self.ablation.get('use_implicit_piggyback_telemetry', True):
+            self.metrics.update_packet_transmission(
+                is_critical=False, is_control=True, size_bytes=16, overhead_phase='operational')
+        if self.ablation.get('enable_network_layer_ack', False):
+            self.metrics.update_packet_transmission(
+                is_critical=False, is_control=True, size_bytes=16, overhead_phase='operational')
+
+        if not hasattr(self, 'source_seq_counters'):
+            self.source_seq_counters = defaultdict(int)
+        self.source_seq_counters[source_id] += 1
+        seq_num = self.source_seq_counters[source_id]
+
+        if not hasattr(self.metrics, '_unique_generated_data_keys'):
+            self.metrics._unique_generated_data_keys = set()
+            self.metrics._unique_delivered_data_keys = set()
+        key = (int(source_id), int(seq_num))
+        if key not in self.metrics._unique_generated_data_keys:
+            self.metrics._unique_generated_data_keys.add(key)
+            self.metrics.update_packet_transmission(
+                is_critical=bool(is_critical), is_control=False, size_bytes=DATA_PACKET_BYTES,
+                is_delivered=False, count_generated=True
+            )
+
+        before_received = self.metrics.received_data_packets
+        before_received_critical = self.metrics.received_critical_packets
+        before_bits = self.metrics.total_bits_received
+        before_delay_len = len(self.metrics.end_to_end_delays)
+
+        table = self.bs.routing_tables.get(source_id, {})
+        if is_critical and self.ablation.get("use_critical_multipath_routing", False):
+            candidate_paths = table.get('critical_paths') or []
+            if not candidate_paths:
+                candidate_paths = [p for p in [
+                    table.get('primary_path'), table.get('secondary_path')] if p]
+            source_risk = self.bs.node_states.get(
+                source_id, {}).get('risk_mean', 0.0)
+            max_paths = 2
+            if self.ablation.get('use_risk_adaptive_coded_multipath', False):
+                if source_risk >= 0.35:
+                    max_paths = 3
+                if source_risk >= 0.65:
+                    max_paths = 4
+            paths_to_trace = [{'type': f'CRITICAL_PATH_{idx+1}', 'path': p}
+                              for idx, p in enumerate(candidate_paths[:max_paths])]
+            required_fragments = 1
+        else:
+            primary_path = table.get('primary_path') or []
+            if primary_path:
+                paths_to_trace = [{'type': 'PRIMARY', 'path': primary_path}]
+            elif self.nodes[source_id].primary_next_hop is not None:
+                paths_to_trace = [{'type': 'PRIMARY', 'path': [
+                    source_id, self.nodes[source_id].primary_next_hop, self.BS_ID]}]
+            else:
+                paths_to_trace = []
+            required_fragments = 1
+
+        delivered_fragments = 0
+        first_success_delay = None
+
+        for path_index, p_info in enumerate(paths_to_trace):
+            route = list(p_info['path'])
+            if not route or route[0] != source_id or route[-1] != self.BS_ID:
+                continue
+            if is_critical and path_index >= 2:
+                self.nodes[source_id]._consume_energy(
+                    tx_bytes=DATA_PACKET_BYTES, distance=30.0)
+
+            packet = {
+                "source_id": source_id,
+                "seq": seq_num,
+                "timestamp": self.current_time,
+                "size_bytes": DATA_PACKET_BYTES,
+                "path_header": [source_id],
+                "payload": payload_value,
+                "priority": "HIGH" if is_critical else "NORMAL",
+                "fragment_id": path_index,
+                "required_fragments": required_fragments,
+                "energy_trace": [(source_id, self.nodes[source_id].E_current)]
+            }
+            packet["hash"] = compute_packet_hash(
+                packet, self.nodes[source_id].crypto_keys)
+            packet_dropped = False
+            path_log = [source_id]
+
+            for idx in range(1, len(route)):
+                current_hop_id = route[idx]
+                if current_hop_id == self.BS_ID:
+                    path_log.append(self.BS_ID)
+                    break
+                hop_node = self.nodes[current_hop_id]
+                path_log.append(current_hop_id)
+                if hasattr(hop_node, 'is_malicious') and hop_node.is_malicious:
+                    packet_dropped = True
+                    break
+                next_hop_id = route[idx + 1] if idx + \
+                    1 < len(route) else self.BS_ID
+                if next_hop_id != self.BS_ID:
+                    next_node = self.nodes[next_hop_id]
+                    distance = math.hypot(
+                        hop_node.x - next_node.x, hop_node.y - next_node.y)
+                else:
+                    bs_node = self.nodes[self.BS_ID]
+                    distance = math.hypot(
+                        hop_node.x - bs_node.x, hop_node.y - bs_node.y)
                 success = hop_node.forward_packet(
-                    {"size_bytes": 128}, self.current_time)
+                    packet, self.current_time, distance)
                 if not success:
                     packet_dropped = True
                     break
 
-                current_hop_id = hop_node.primary_next_hop
-
-            # Reached Base Station
-            if not packet_dropped and current_hop_id == self.BS_ID:
-                path_log.append(self.BS_ID)
-                # Delivery delay calculation (Simulated hop delay)
-                simulated_delay = len(path_log) * 0.100  # 100ms per hop
-
-                # Tell Metrics packet arrived
-                self.metrics.update_packet_transmission(
-                    is_critical=is_critical, is_control=False,
-                    size_bytes=128, is_delivered=True, delay=simulated_delay
-                )
-
-                # Tell BS Data Plane (Logging for IDS)
-                packet_data = {"source_id": source_id, "seq": seq_num, "timestamp": self.current_time,
-                               "piggybacked_energy": self.nodes[source_id].E_current}
+            if not packet_dropped and path_log[-1] == self.BS_ID:
+                simulated_delay = len(path_log) * 0.100
+                delivered_fragments += 1
+                if first_success_delay is None or simulated_delay < first_success_delay:
+                    first_success_delay = simulated_delay
+                packet_data = dict(packet)
+                packet_data["path_header"] = path_log
                 self.bs.data_plane_receive(
                     packet_data, path_log, receive_time=self.current_time + simulated_delay)
 
+        if delivered_fragments >= required_fragments:
+            self.metrics.update_packet_transmission(
+                is_critical=is_critical, is_control=False, size_bytes=DATA_PACKET_BYTES,
+                is_delivered=True, delay=first_success_delay if first_success_delay is not None else 0.0,
+                count_generated=False
+            )
+
+        after_received = self.metrics.received_data_packets
+        if after_received > before_received:
+            if key in self.metrics._unique_delivered_data_keys:
+                delta_recv = after_received - before_received
+                self.metrics.received_data_packets -= delta_recv
+                if is_critical:
+                    self.metrics.received_critical_packets = max(
+                        before_received_critical, self.metrics.received_critical_packets - delta_recv)
+                self.metrics.total_bits_received = before_bits
+                del self.metrics.end_to_end_delays[before_delay_len:]
+            else:
+                self.metrics._unique_delivered_data_keys.add(key)
+
     def _push_updated_routes(self):
-        """Pushes any new routes calculated by BS during its Epoch."""
         for n_id, table in self.bs.routing_tables.items():
             if n_id in self.nodes:
-                self.nodes[n_id].primary_next_hop = table.get('primary')
-                self.nodes[n_id].secondary_next_hop = table.get('secondary')
-
-# =====================================================================
-# 4. STATISTICAL RUNNER (30 Seeds & Ablation Testing)
-# =====================================================================
-
-
-def run_statistical_experiments():
-    """
-    Runs the simulation over 30 different random seeds to ensure statistical significance.
-    This is the main entry point required for Q1 journal submissions.
-    """
-    NUM_SEEDS = 30
-    NUM_NODES = 100
-    SIM_TIME = 3600  # 1 hour simulation
-
-    # Example: Running the PROPOSED architecture (All features ON)
-    proposed_config = {
-        "use_gradient_symmetric_discovery": True,
-        "use_adaptive_edge_threshold": True,
-        "use_critical_multipath_routing": True,  # Crucial for QoS
-        "use_implicit_piggyback_telemetry": True,  # Crucial for Overhead
-        "use_network_tomography_for_delay": True,
-        "use_intersection_logic_for_droppers": True,
-        "use_asynchronous_processing_pipeline": True,
-        "use_shannon_entropy_weights": True,
-        "use_security_veto_aggregation": True,
-        "use_stealthy_attacker_detection": True,  # WRSN Security
-        "use_zero_overhead_spoof_detection": True
-    }
-
-    all_results = []
-
-    for seed in range(1, NUM_SEEDS + 1):
-        print(f"\n--- Starting Seed {seed}/{NUM_SEEDS} ---")
-
-        sim = SimulatorManager(num_nodes=NUM_NODES, sim_time=SIM_TIME,
-                               ablation_config=proposed_config, seed=seed)
-        sim.run_simulation()
-
-        # Extract results using the decoupled MetricsCollector
-        summary = sim.metrics.export_summary(
-            seed_num=seed, ablation_scenario_name="Proposed_WRSN", sim_time=SIM_TIME)
-        all_results.append(summary)
-
-    # Export to Excel/CSV for plotting Error Bars and T-tests in MATLAB/Python
-    df_results = pd.DataFrame(all_results)
-    df_results.to_csv("proposed_model_results_30seeds.csv", index=False)
-    print("\n[SUCCESS] Statistical experiments completed. Results saved to CSV.")
-    print("Average Overall PDR:", df_results["Overall_PDR"].mean())
-    print("Average Critical PDR:", df_results["Critical_PDR"].mean())
-    print("Average FPR (False Positive Rate):", df_results["FPR"].mean())
-
-    metrics_to_analyze = ["Overall_PDR", "Critical_PDR",
-                          "TPR", "FPR", "F1_Score", "Throughput"]
-
-    for metric in metrics_to_analyze:
-        data = df_results[metric]
-        mean_val = np.mean(data)
-        std_err = stats.sem(data)  # Standard Error of the Mean
-
-        # Calculate the 95% Confidence Interval
-        # This means we are 95% confident that the model's performance in the real world is within this interval
-        ci = stats.t.interval(0.95, len(data)-1, loc=mean_val, scale=std_err)
-
-        print(f"{metric}:")
-        print(f"   Mean: {mean_val:.4f}")
-        print(f"   95% CI: [{ci[0]:.4f}, {ci[1]:.4f}]")
-        print("-" * 30)
-
-        # Example for P-Value (T-test):
-        # t_stat, p_value = stats.ttest_ind(df_results["Overall_PDR"], baseline_results["Overall_PDR"])
-        # print(f"P-Value (Proposed vs Baseline): {p_value}")
-        # If p_value < 0.05, your method is statistically better by a certain margin!
-
-
-if __name__ == "__main__":
-    run_statistical_experiments()
+                new_adaptive_th = self.bs.get_adaptive_threshold_for_node(n_id)
+                self.nodes[n_id].update_policies_from_bs(
+                    primary_hop=table.get('primary'),
+                    secondary_hop=table.get('secondary'),
+                    new_threshold=new_adaptive_th
+                )
