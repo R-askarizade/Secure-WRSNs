@@ -2,10 +2,14 @@ import math
 import numpy as np
 import pandas as pd
 
+
 class MetricsCollector:
     def __init__(self, total_nodes, total_rounds_or_time):
         self.total_nodes = total_nodes
         self.total_rounds_or_time = total_rounds_or_time
+        self.current_sim_time = 0.0
+        self._unique_generated_data_keys = set()
+        self._unique_delivered_data_keys = set()
 
         self.tp = 0
         self.tn = 0
@@ -61,6 +65,44 @@ class MetricsCollector:
 
         self.source_sequence_replay_events = 0
         self.packet_hmac_failures = 0
+
+        # INNOVATION AUDIT METRICS  
+        self.charging_decision_tp = 0
+        self.charging_decision_fp = 0
+        self.charging_decision_tn = 0
+        self.charging_decision_fn = 0
+        self.silent_node_sos_count = 0
+        self.silent_node_rescue_count = 0
+        self.false_sos_count = 0
+        self.time_to_critical_before_mc_arrival = []
+
+        self.delay_attribution_trials = 0
+        self.delay_attribution_correct = 0
+        self.false_delay_accusations = 0
+        self.tomography_windows = 0
+        self.tomography_observable_windows = 0
+        self.tomography_rank_deficient_windows = 0
+        self.tomography_residual_errors = []
+
+        self.shadow_precompute_count = 0
+        self.shadow_route_hit_count = 0
+        self.ordinary_route_repair_times_ms = []
+        self.shadow_route_repair_times_ms = []
+        self.shadow_extra_compute_times_ms = []
+
+        self.critical_secondary_path_opportunities = 0
+        self.critical_secondary_path_available = 0
+        self.critical_redundant_copy_accepted = 0
+        self.critical_redundant_copy_rejected = 0
+        self.sparse_topology_no_backup_count = 0
+
+        self.mc_replay_rejections = 0
+        self.charge_hoarder_attempts = 0
+        self.charge_hoarder_detections = 0
+        self.fake_charger_attempts = 0
+        self.fake_charger_detections = 0
+        self.raw_sos_validation_attempts = 0
+        self.raw_sos_blocked = 0
 
     def update_packet_transmission(self, is_critical, is_control, size_bytes, is_delivered=False, delay=None, overhead_phase='operational', count_generated=True):
         if is_control:
@@ -141,6 +183,69 @@ class MetricsCollector:
         if node_id in self._critical_nodes_seen:
             self.mc_avoided_node_deaths += 1
             self._critical_nodes_seen.discard(node_id)
+
+    # INNOVATION AUDIT RECORDING METHODS
+    def record_charging_decision(self, needed, admitted):
+        needed = bool(needed)
+        admitted = bool(admitted)
+        if needed and admitted:
+            self.charging_decision_tp += 1
+        elif (not needed) and admitted:
+            self.charging_decision_fp += 1
+        elif (not needed) and (not admitted):
+            self.charging_decision_tn += 1
+        else:
+            self.charging_decision_fn += 1
+
+    def record_silent_sos_result(self, rescued=False, false_sos=False, response_time=None):
+        self.silent_node_sos_count += 1
+        if rescued:
+            self.silent_node_rescue_count += 1
+        if false_sos:
+            self.false_sos_count += 1
+        if response_time is not None:
+            self.time_to_critical_before_mc_arrival.append(
+                max(0.0, float(response_time)))
+
+    def record_delay_tomography_result(self, observable, correct=False, false_accusation=False, residual_error=None):
+        self.tomography_windows += 1
+        self.delay_attribution_trials += 1
+        if observable:
+            self.tomography_observable_windows += 1
+        else:
+            self.tomography_rank_deficient_windows += 1
+        if correct:
+            self.delay_attribution_correct += 1
+        if false_accusation:
+            self.false_delay_accusations += 1
+        if residual_error is not None:
+            self.tomography_residual_errors.append(float(residual_error))
+
+    def record_shadow_route_result(self, precomputed=False, hit=False, ordinary_ms=None, shadow_ms=None, extra_compute_ms=None):
+        if precomputed:
+            self.shadow_precompute_count += 1
+        if hit:
+            self.shadow_route_hit_count += 1
+        if ordinary_ms is not None:
+            self.ordinary_route_repair_times_ms.append(float(ordinary_ms))
+        if shadow_ms is not None:
+            self.shadow_route_repair_times_ms.append(float(shadow_ms))
+        if extra_compute_ms is not None:
+            self.shadow_extra_compute_times_ms.append(float(extra_compute_ms))
+
+    def record_critical_multipath_opportunity(self, secondary_available=False, accepted=0, rejected=0):
+        self.critical_secondary_path_opportunities += 1
+        if secondary_available:
+            self.critical_secondary_path_available += 1
+        else:
+            self.sparse_topology_no_backup_count += 1
+        self.critical_redundant_copy_accepted += int(max(0, accepted))
+        self.critical_redundant_copy_rejected += int(max(0, rejected))
+
+    @staticmethod
+    def _safe_rate(num, den, scale=1.0):
+        den = float(den)
+        return (float(num) / den) * scale if den > 0 else 0.0
 
     def calculate_ids_metrics(self):
         tp, tn, fp, fn = self.tp, self.tn, self.fp, self.fn
@@ -266,6 +371,73 @@ class MetricsCollector:
         summary['MC_Avoided_Node_Deaths'] = self.mc_avoided_node_deaths
         summary['Energy_Critical_Node_Events'] = self.energy_critical_node_events
         summary['Energy_Critical_Node_Deaths'] = self.energy_critical_node_deaths
+
+        # INNOVATION AUDIT EXPORTS
+        charge_tp = self.charging_decision_tp
+        charge_fp = self.charging_decision_fp
+        charge_tn = self.charging_decision_tn
+        charge_fn = self.charging_decision_fn
+        charge_total = charge_tp + charge_fp + charge_tn + charge_fn
+        summary['Charging_Decision_Accuracy'] = self._safe_rate(
+            charge_tp + charge_tn, charge_total)
+        summary['False_Charging_Admissions'] = charge_fp
+        summary['Charging_Request_Precision'] = self._safe_rate(
+            charge_tp, charge_tp + charge_fp)
+        summary['Charging_Request_Recall'] = self._safe_rate(
+            charge_tp, charge_tp + charge_fn)
+        summary['Silent_Node_SOS_Count'] = self.silent_node_sos_count
+        summary['Silent_Node_Rescue_Rate'] = self._safe_rate(
+            self.silent_node_rescue_count, self.silent_node_sos_count)
+        summary['False_SOS_Rate'] = self._safe_rate(
+            self.false_sos_count, self.silent_node_sos_count)
+        summary['Avg_Time_To_Critical_Before_MC_Arrival'] = float(np.mean(
+            self.time_to_critical_before_mc_arrival)) if self.time_to_critical_before_mc_arrival else 0.0
+        summary['MC_Deadline_Success_Rate'] = self._safe_rate(
+            self.mc_avoided_node_deaths, self.mc_avoided_node_deaths + self.mc_missed_charging_deadlines)
+
+        summary['Forged_MC_Report_Rejection_Rate'] = self._safe_rate(
+            self.mc_rejected_unauth_reports, self.mc_fake_reports_attempted)
+        summary['MC_Replay_Rejection_Rate'] = self._safe_rate(
+            self.mc_replay_rejections, self.mc_replay_rejections + max(0, self.mc_fake_reports_accepted))
+        summary['Fake_Charger_Detection_Rate'] = self._safe_rate(
+            self.fake_charger_detections, self.fake_charger_attempts)
+        summary['Charge_Hoarder_Detection_Rate'] = self._safe_rate(
+            self.charge_hoarder_detections, self.charge_hoarder_attempts)
+        summary['Location_Spoof_Rejection_Rate'] = self._safe_rate(
+            self.mc_location_spoof_attempts - self.mc_location_spoof_accepted, self.mc_location_spoof_attempts)
+        summary['Raw_SOS_Blocking_Rate'] = self._safe_rate(
+            self.raw_sos_blocked, self.raw_sos_validation_attempts)
+
+        summary['Delay_Attribution_Accuracy'] = self._safe_rate(
+            self.delay_attribution_correct, self.delay_attribution_trials)
+        summary['False_Delay_Accusation_Rate'] = self._safe_rate(
+            self.false_delay_accusations, self.delay_attribution_trials)
+        summary['Tomography_Observability_Ratio'] = self._safe_rate(
+            self.tomography_observable_windows, self.tomography_windows)
+        summary['Tomography_Rank_Deficient_Windows'] = self.tomography_rank_deficient_windows
+        summary['Tomography_Mean_Residual_Error'] = float(np.mean(
+            self.tomography_residual_errors)) if self.tomography_residual_errors else 0.0
+
+        summary['Shadow_Precompute_Count'] = self.shadow_precompute_count
+        summary['Shadow_Route_Hit_Count'] = self.shadow_route_hit_count
+        summary['Shadow_Route_Hit_Rate'] = self._safe_rate(
+            self.shadow_route_hit_count, self.shadow_precompute_count)
+        summary['Ordinary_Route_Repair_Time_ms'] = float(np.mean(
+            self.ordinary_route_repair_times_ms)) if self.ordinary_route_repair_times_ms else 0.0
+        summary['Shadow_Route_Repair_Time_ms'] = float(np.mean(
+            self.shadow_route_repair_times_ms)) if self.shadow_route_repair_times_ms else 0.0
+        ordinary_mean = summary['Ordinary_Route_Repair_Time_ms']
+        shadow_mean = summary['Shadow_Route_Repair_Time_ms']
+        summary['Route_Repair_Speedup_Ratio'] = (
+            ordinary_mean / shadow_mean) if shadow_mean > 0 else 0.0
+        summary['Extra_BS_Shadow_Compute_ms'] = float(np.mean(
+            self.shadow_extra_compute_times_ms)) if self.shadow_extra_compute_times_ms else 0.0
+
+        summary['Critical_Secondary_Path_Availability_Rate'] = self._safe_rate(
+            self.critical_secondary_path_available, self.critical_secondary_path_opportunities)
+        summary['Critical_Redundant_Copy_Accepted_Count'] = self.critical_redundant_copy_accepted
+        summary['Critical_Redundant_Copy_Rejected_Count'] = self.critical_redundant_copy_rejected
+        summary['Sparse_Topology_NoBackup_Count'] = self.sparse_topology_no_backup_count
 
         return summary
 

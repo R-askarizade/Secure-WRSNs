@@ -15,11 +15,11 @@ ACK_PACKET_BITS = 16 * 8
 CONTROL_PACKET_BYTES_SMALL = 16
 
 
-def _phase1_canonical_json(obj):
+def _canonical_json(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
 
 
-def _phase1_source_energy(packet):
+def _source_energy(packet):
     src = packet.get("source_id")
     for item in packet.get("energy_trace", []) or []:
         try:
@@ -42,9 +42,9 @@ def compute_packet_hash(packet, key):
         "priority": packet.get("priority"),
         "payload": packet.get("payload"),
         "size_bytes": packet.get("size_bytes"),
-        "source_energy": _phase1_source_energy(packet),
+        "source_energy": _source_energy(packet),
     }
-    return hmac.new(str(key).encode("utf-8"), _phase1_canonical_json(safe_packet), hashlib.sha256).hexdigest()
+    return hmac.new(str(key).encode("utf-8"), _canonical_json(safe_packet), hashlib.sha256).hexdigest()
 
 
 def make_mc_mac(shared_key, node_id, injected_energy, mc_x, mc_y, mc_id=None, counter=None, nonce=None, timestamp=None):
@@ -61,7 +61,7 @@ def make_mc_mac(shared_key, node_id, injected_energy, mc_x, mc_y, mc_id=None, co
         "nonce": nonce,
         "timestamp": None if timestamp is None else round(float(timestamp), 6),
     }
-    return hmac.new(str(shared_key).encode("utf-8"), _phase1_canonical_json(msg), hashlib.sha256).hexdigest()
+    return hmac.new(str(shared_key).encode("utf-8"), _canonical_json(msg), hashlib.sha256).hexdigest()
 
 
 def _ci95(series):

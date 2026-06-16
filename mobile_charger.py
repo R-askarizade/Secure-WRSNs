@@ -3,6 +3,7 @@ import time
 import secrets
 from config import make_mc_mac
 
+
 class MobileCharger:
     def __init__(self, mc_id, depot_x, depot_y, capacity, speed, base_station, metrics_collector):
         self.mc_id = mc_id
@@ -71,13 +72,13 @@ class MobileCharger:
         return travel_time
 
     def charge_node(self, target_node):
-        if getattr(self, 'zeroized', False) or self.crypto_keys is None:
+        if self.zeroized or self.crypto_keys is None:
             return 0
         if self.E_current <= 0:
             return 0
 
-        before_e = float(getattr(target_node, 'E_current', 0.0))
-        now = float(getattr(self.metrics, 'current_sim_time', 0.0))
+        before_e = float(target_node.E_current)
+        now = float(self.metrics.current_sim_time)
 
         self.status = "CHARGING"
         needed_energy = target_node.E_max - target_node.E_current
@@ -93,8 +94,7 @@ class MobileCharger:
         self.bs.verify_charging_location(target_node.node_id, self.x, self.y)
         self.report_counter += 1
         nonce = secrets.token_hex(12)
-        report_time = float(
-            getattr(self.metrics, 'current_sim_time', time.time()))
+        report_time = float(self.metrics.current_sim_time)
 
         mac_tag = make_mc_mac(self.crypto_keys, target_node.node_id, injected_energy, self.x, self.y,
                               mc_id=self.mc_id, counter=self.report_counter, nonce=nonce, timestamp=report_time)
@@ -107,7 +107,7 @@ class MobileCharger:
                 f"[MC AUTH] Charging report from MC {self.mc_id} was rejected by BS.")
 
         self.status = "IDLE"
-        after_e = float(getattr(target_node, 'E_current', 0.0))
+        after_e = float(target_node.E_current)
         actual_injected = max(0.0, after_e - before_e)
         self.metrics.record_mc_charge(
             target_node.node_id, actual_injected, charging_time, now)

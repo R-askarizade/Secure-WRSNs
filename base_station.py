@@ -8,7 +8,7 @@ import networkx as nx
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from config import compute_packet_hash, make_mc_mac, _phase1_source_energy, DATA_PACKET_BITS
+from config import compute_packet_hash, make_mc_mac, _source_energy, DATA_PACKET_BITS
 from routing import BaselineRouting
 
 
@@ -44,8 +44,10 @@ class BaseStation:
 
         self.eta_charging = 0.70
         self.mc_recent_injected_energy = defaultdict(float)
+        self.mc_real_injected_energy = defaultdict(float)
         self.quarantined_zones = []
         self.mc_reference = None
+        self.mc_shared_key = None
 
         self.env_window_size = 50
         self.threshold_k = 2.0
@@ -57,6 +59,7 @@ class BaseStation:
         self.T_CRITICAL_FE = 0.1
         self.T_WARNING_FE = 0.6
         self.standby_routing_tables = None
+        self.current_dynamic_weights = np.array([0.25, 0.25, 0.15, 0.15, 0.20])
 
         self.risk_history = defaultdict(lambda: deque(maxlen=20))
         self.path_history = deque(maxlen=500)
@@ -66,6 +69,13 @@ class BaseStation:
         self.RISK_BLACKLIST_LCB = 0.85
         self.RISK_HYSTERESIS_EPOCHS = 3
         self.RISK_WARMUP_EPOCHS = 3
+
+        # Extracted Magic Numbers for Risk Weighting
+        self.RISK_WEIGHTS = {
+            'fcm': 0.45, 'auth': 0.90, 'drop': 0.80, 'delay': 0.35,
+            'traffic': 0.35, 'energy': 0.55, 'stealth': 0.95, 'sed': 0.80,
+            'mc': 0.95, 'counterfactual': 0.85
+        }
 
         self.tamper_history = defaultdict(lambda: deque(maxlen=5))
         self.TAMPER_PERSISTENCE_EPOCHS = 3
@@ -110,13 +120,13 @@ class BaseStation:
         if value is not None:
             self.environmental_history[node_id].append(float(value))
 
-    def _phase1_normalize_path_for_bs(self, path_taken):
+    def _normalize_path_for_bs(self, path_taken):
         path = list(path_taken or [])
         if path and path[-1] != self.BS_ID:
             path.append(self.BS_ID)
         return path
 
-    def _phase1_approved_critical_paths(self, source_id):
+    def _approved_critical_paths(self, source_id):
         routes = self.routing_tables.get(source_id, {}) or {}
         candidates = []
         for key in ('critical_paths', 'primary_path', 'secondary_path'):
@@ -129,24 +139,24 @@ class BaseStation:
                 candidates.append(val)
         approved = set()
         for p in candidates:
-            p = tuple(self._phase1_normalize_path_for_bs(p))
+            p = tuple(self._normalize_path_for_bs(p))
             if len(p) >= 2 and p[0] == source_id and p[-1] == self.BS_ID:
                 approved.add(p)
         return approved
 
-    def _phase1_is_legitimate_critical_multipath_copy_v3(self, source_id, seq, packet_type, path_taken, packet):
+    def _is_legitimate_critical_multipath_copy_v3(self, source_id, seq, packet_type, path_taken, packet):
         if packet.get('priority') != 'HIGH':
             return False
         if not self.ablation.get('use_critical_multipath_routing', True):
             return False
-        path_tuple = tuple(self._phase1_normalize_path_for_bs(path_taken))
-        if path_tuple not in self._phase1_approved_critical_paths(source_id):
+        path_tuple = tuple(self._normalize_path_for_bs(path_taken))
+        if path_tuple not in self._approved_critical_paths(source_id):
             return False
         seen = self.received_seq_paths_by_type[source_id][packet_type][int(
             seq)]
         return path_tuple not in seen
 
-    def _phase1_verify_source_hmac(self, packet, source_id):
+    def _verify_source_hmac(self, packet, source_id):
         key = self.node_states.get(source_id, {}).get('crypto_keys')
         expected_hash = compute_packet_hash(packet, key)
         supplied_hash = packet.get('hash')
@@ -155,7 +165,7 @@ class BaseStation:
         packet['hash_valid'] = bool(valid)
         return bool(valid)
 
-    def _phase1_log_auth_failure(self, source_id, packet, path_taken, receive_time):
+    def _log_auth_failure(self, source_id, packet, path_taken, receive_time):
         self.packet_auth_failures[source_id] += 1
         self.metrics.packet_hmac_failures += 1
         if source_id in self.node_states:
@@ -177,7 +187,7 @@ class BaseStation:
 
     def data_plane_receive(self, packet, path_taken, receive_time):
         source_id = packet['source_id']
-        path_taken = self._phase1_normalize_path_for_bs(
+        path_taken = self._normalize_path_for_bs(
             packet.get('path_header', path_taken))
         path_tuple = tuple(path_taken)
         packet_type = packet.get('type', 'DATA')
@@ -185,8 +195,8 @@ class BaseStation:
         interrupt_triggered = False
 
         if self.ablation.get('require_source_packet_hmac', True):
-            if not self._phase1_verify_source_hmac(packet, source_id):
-                self._phase1_log_auth_failure(
+            if not self._verify_source_hmac(packet, source_id):
+                self._log_auth_failure(
                     source_id, packet, path_taken, receive_time)
                 if self.ablation.get('use_asynchronous_processing_pipeline', True):
                     self.control_plane_epoch()
@@ -209,7 +219,7 @@ class BaseStation:
         if last_by_type is not None:
             expected = last_by_type + 1
             if seq <= last_by_type:
-                if seq == last_by_type and self._phase1_is_legitimate_critical_multipath_copy_v3(
+                if seq == last_by_type and self._is_legitimate_critical_multipath_copy_v3(
                         source_id, seq, seq_type, path_taken, packet):
                     accepted_redundant_multipath_copy = True
                 else:
@@ -266,7 +276,7 @@ class BaseStation:
         self.path_history.append(
             {'path': path_tuple, 'success': True, 'priority': priority})
 
-        src_energy = _phase1_source_energy(packet)
+        src_energy = _source_energy(packet)
         if src_energy is not None and source_id in self.node_states:
             self.node_states[source_id]['E_claimed'] = src_energy
 
@@ -357,7 +367,7 @@ class BaseStation:
             exec_time = (time.time() - start_time) * 1000
             self.metrics.record_execution_time('CORE', exec_time)
 
-            if self.ablation.get('use_phase1_fuzzy_validity_metrics', True):
+            if self.ablation.get('use_fuzzy_validity_metrics', True):
                 try:
                     node_ids = [
                         nid for nid in self.node_states.keys() if nid != self.BS_ID]
@@ -366,7 +376,7 @@ class BaseStation:
                                      1, 1, 1, 1, 1]) for nid in node_ids], dtype=float)
                         X = np.nan_to_num(X, nan=0.0, posinf=1.0, neginf=0.0)
 
-                        def _phase1_membership(state):
+                        def _membership(state):
                             base_risk = state.get(
                                 'risk_mean', state.get('fcm_risk', 0.0))
                             try:
@@ -383,7 +393,7 @@ class BaseStation:
                             return min(1.0 - 1e-9, max(1e-9, u_mal))
 
                         u_mal = np.array(
-                            [_phase1_membership(self.node_states[nid]) for nid in node_ids], dtype=float)
+                            [_membership(self.node_states[nid]) for nid in node_ids], dtype=float)
                         U = np.column_stack((1.0 - u_mal, u_mal))
 
                         N = X.shape[0]
@@ -449,7 +459,7 @@ class BaseStation:
                                 self.metrics.xie_beni_indices.append(float(xb))
 
                 except Exception as exc:
-                    if self.ablation.get('debug_phase1_fuzzy_metrics', False):
+                    if self.ablation.get('debug_fuzzy_metrics', False):
                         print(
                             f'[FUZZY-METRICS] Phase-1 validity calculation skipped: {exc}')
 
@@ -960,15 +970,10 @@ class BaseStation:
                 'counterfactual': min(1.0, max(0.0, float(cf_attr.get(nid, 0.0))))
             }
 
-            weights = {
-                'fcm': 0.45, 'auth': 0.90, 'drop': 0.80, 'delay': 0.35,
-                'traffic': 0.35, 'energy': 0.55, 'stealth': 0.95, 'sed': 0.80,
-                'mc': 0.95, 'counterfactual': 0.85
-            }
-
             survival = 1.0
             for key, risk_value in risks.items():
-                survival *= (1.0 - min(1.0, weights[key] * risk_value))
+                survival *= (1.0 -
+                             min(1.0, self.RISK_WEIGHTS[key] * risk_value))
             instantaneous_risk = 1.0 - survival
 
             hist = self.risk_history[nid]
@@ -1086,12 +1091,16 @@ class BaseStation:
 
             if deviation_mc > (2.0 * tolerance):
                 if E_injected > 0 and delta_claimed <= tolerance:
+                    self.metrics.charge_hoarder_attempts += 1
+                    self.metrics.charge_hoarder_detections += 1
                     print(
                         f"[WRSN SECURITY] Charge Hoarding detected at Node {nid}! Hard veto triggered.")
                     state['hard_veto'] = True
                     state['status'] = 'BLACKLISTED'
                     state['FE'] = 0.0
                 elif E_injected == 0 and delta_claimed > tolerance:
+                    self.metrics.fake_charger_attempts += 1
+                    self.metrics.fake_charger_detections += 1
                     print(
                         f"[WRSN SECURITY] Vampire Attack detected at Node {nid}! Hard veto triggered.")
                     state['hard_veto'] = True
@@ -1144,8 +1153,13 @@ class BaseStation:
                         ok = (E_est / max(E_initial, 1e-12)) <= float(
                             self.ablation.get('charge_need_ratio', self.CHARGE_NEED_RATIO))
 
+        if emergency:
+            self.metrics.raw_sos_validation_attempts += 1
+            if not ok:
+                self.metrics.raw_sos_blocked += 1
+
         if self.energy_experiment_active:
-            if node_id in getattr(self, 'pending_sos_requests', set()) or node_id in getattr(self, 'secure_charging_queue', []):
+            if node_id in self.pending_sos_requests or node_id in self.secure_charging_queue:
                 current_t = float(
                     getattr(self.metrics, 'current_sim_time', 0.0))
                 self.metrics.record_charging_request(
@@ -1211,21 +1225,30 @@ class BaseStation:
         self.routes_updated = False
 
         if critical_nodes and self.standby_routing_tables is not None:
+            _shadow_activation_t0 = time.time()
             self.routing_tables = self.standby_routing_tables
             self.standby_routing_tables = None
             self._last_route_signature = route_signature
             self.routes_updated = True
+            self.metrics.record_shadow_route_result(
+                hit=True, shadow_ms=(time.time() - _shadow_activation_t0) * 1000.0)
         elif active_changed or force_periodic_refresh or not self.routing_tables:
+            _ordinary_route_t0 = time.time()
             self.routing_tables = self.routing_engine.compute_routing_tables(
                 active_nodes, node_penalties)
             self._last_route_signature = route_signature
             self.routes_updated = True
+            self.metrics.record_shadow_route_result(
+                ordinary_ms=(time.time() - _ordinary_route_t0) * 1000.0)
 
         if needs_shadow_calc:
             if shadow_changed or force_periodic_refresh or self.standby_routing_tables is None:
+                _shadow_pre_t0 = time.time()
                 self.standby_routing_tables = self.routing_engine.compute_routing_tables(
                     shadow_active_nodes, shadow_penalties)
                 self._last_shadow_signature = shadow_signature
+                self.metrics.record_shadow_route_result(
+                    precomputed=True, extra_compute_ms=(time.time() - _shadow_pre_t0) * 1000.0)
         else:
             self.standby_routing_tables = None
             self._last_shadow_signature = None
@@ -1286,6 +1309,7 @@ class BaseStation:
         if counter <= self.mc_last_counter[mc_key] or nonce in self.mc_seen_nonces[mc_key]:
             self.metrics.mc_fake_reports_attempted += 1
             self.metrics.mc_rejected_unauth_reports += 1
+            self.metrics.mc_replay_rejections += 1
             self.mc_replay_rejections += 1
             return False
 

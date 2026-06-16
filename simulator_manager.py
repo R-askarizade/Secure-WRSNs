@@ -11,6 +11,7 @@ from mobile_charger import MobileCharger
 from metric_collector import MetricsCollector
 from routing import BaselineRouting
 
+
 class SimulatorManager:
     def __init__(self, num_nodes, sim_time, ablation_config, seed, network_size=(100, 100)):
         self.num_nodes = num_nodes
@@ -19,13 +20,15 @@ class SimulatorManager:
         self.seed = seed
         self.network_size = network_size
         self.BS_ID = 0
+        self.transmission_range = float(
+            self.ablation.get('transmission_range', 40.0))
+        self.source_seq_counters = defaultdict(int)
 
         random.seed(self.seed)
         np.random.seed(self.seed)
 
         self.metrics = MetricsCollector(
             total_nodes=num_nodes, total_rounds_or_time=sim_time)
-
         self.bs = BaseStation(metrics_collector=self.metrics,
                               ablation_config=self.ablation, bs_id=self.BS_ID)
 
@@ -36,7 +39,7 @@ class SimulatorManager:
         self.nodes = {}
 
         self.routing_engine = BaselineRouting(
-            bs_id=self.BS_ID, transmission_range=40.0,
+            bs_id=self.BS_ID, transmission_range=self.transmission_range,
             max_critical_paths=4 if self.ablation.get('use_risk_adaptive_coded_multipath', False) else 2)
         self.bs.routing_engine = self.routing_engine
 
@@ -75,7 +78,6 @@ class SimulatorManager:
         BS_ADV_SIZE = 16
         REG_SIZE = 48
         POLICY_SIZE = 64
-        TX_RANGE = 40.0
 
         def get_physical_neighbors(node_id):
             n1 = self.nodes[node_id]
@@ -83,7 +85,7 @@ class SimulatorManager:
             for n2_id, n2 in self.nodes.items():
                 if node_id != n2_id:
                     dist = math.hypot(n1.x - n2.x, n1.y - n2.y)
-                    if dist <= TX_RANGE:
+                    if dist <= self.transmission_range:
                         neighbors.append(n2_id)
             return neighbors
 
@@ -92,7 +94,7 @@ class SimulatorManager:
         current_hop = 1
 
         self.nodes[self.BS_ID]._consume_energy(
-            tx_bytes=BS_ADV_SIZE, distance=TX_RANGE)
+            tx_bytes=BS_ADV_SIZE, distance=self.transmission_range)
         self.nodes[self.BS_ID].seen_adv_seq = seq_num
         self.nodes[self.BS_ID].hop_count_to_bs = 0
 
@@ -110,7 +112,7 @@ class SimulatorManager:
                         neighbor_node.temp_parent = sender_id
                         neighbor_node._consume_energy(rx_bytes=BS_ADV_SIZE)
                         neighbor_node._consume_energy(
-                            tx_bytes=BS_ADV_SIZE, distance=TX_RANGE)
+                            tx_bytes=BS_ADV_SIZE, distance=self.transmission_range)
                         self.metrics.update_packet_transmission(
                             is_critical=False, is_control=True, size_bytes=BS_ADV_SIZE, overhead_phase='setup')
                         next_wave.append(neighbor_id)
@@ -144,14 +146,37 @@ class SimulatorManager:
             if not packet_dropped:
                 self.metrics.update_packet_transmission(
                     is_critical=False, is_control=True, size_bytes=REG_SIZE, overhead_phase='setup')
+
+                # Standardized Node State Dictionary initialization
                 self.bs.node_states[node.node_id] = {
                     'x': node.x, 'y': node.y,
                     'E_initial': node.E_max,
                     'E_claimed': node.E_max,
+                    'E_claimed_prev': node.E_max,
+                    'E_claimed_prev_SED': node.E_max,
                     'E_est': node.E_current,
+                    'E_consumption_est_cumulative': 0.0,
+                    'total_injected_energy': 0.0,
                     'trust_vector': [1.0, 1.0, 1.0, 1.0, 1.0],
                     'T1_history': 1.0, 'T2_history': 1.0, 'T3_history': 1.0, 'T4_history': 1.0, 'T5_history': 1.0,
-                    'FE': 1.0, 'status': 'WHITELISTED', 'crypto_keys': node.crypto_keys
+                    'FE': 1.0,
+                    'status': 'WHITELISTED',
+                    'crypto_keys': node.crypto_keys,
+                    'hard_veto': False,
+                    'spoof_trust': 1.0,
+                    'spoof_rescue_triggered': False,
+                    'Deviation_MC_norm': 0.0,
+                    'SED_index': 0.0,
+                    'S_stealth': 0.0,
+                    'risk_mean': 0.0,
+                    'risk_instant': 0.0,
+                    'risk_lcb': 0.0,
+                    'risk_uncertainty': 0.0,
+                    'fcm_risk': 0.0,
+                    'prev_epoch_seq': 0,
+                    'lambda_gen': 0.0,
+                    'blacklist_counter': 0,
+                    'idle_sensing_energy_epoch': 0.0
                 }
 
         self.current_time += 2.0
@@ -207,18 +232,18 @@ class SimulatorManager:
             f"[Seed {self.seed}] Bootstrapping Complete. Temp trees cleared. Network Setup Time: {self.current_time}s")
 
     def service_mobile_charger(self):
-        if getattr(self.bs, 'energy_experiment_active', False):
+        if self.energy_experiment_active:
             for nid, node in self.nodes.items():
-                if nid == self.BS_ID or getattr(node, 'status', None) != 'ALIVE':
+                if nid == self.BS_ID or node.status != 'ALIVE':
                     continue
-                if float(getattr(node, 'E_current', 0.0)) <= float(getattr(node, 'E_critical', 0.0)):
+                if node.E_current <= node.E_critical:
                     self.metrics.record_energy_critical(nid, self.current_time)
 
         if not self.bs.energy_experiment_active or self.mc.status != "IDLE":
             return
 
         target_node = None
-        secure_queue = getattr(self.bs, "secure_charging_queue", [])
+        secure_queue = self.bs.secure_charging_queue
         secure_queue[:] = [
             nid for nid in secure_queue if self.bs.validate_charging_request(nid, emergency=True)]
 
@@ -368,7 +393,8 @@ class SimulatorManager:
                     is_critical=False, is_control=True, size_bytes=16, overhead_phase='operational')
 
         self.bootstrap_network()
-        self.inject_attacks(attack_percentage=0.15)
+        self.inject_attacks(attack_percentage=float(
+            self.ablation.get('attack_percentage', 0.15)))
 
         packet_seq_num = 0
         next_event_time = random.expovariate(
@@ -401,7 +427,8 @@ class SimulatorManager:
                 active_node_id = random.choice(alive_nodes)
                 active_node = self.nodes[active_node_id]
 
-                is_critical_event = random.random() < 0.10
+                is_critical_event = random.random() < float(
+                    self.ablation.get('critical_event_probability', 0.10))
                 raw_data = 80.0 if is_critical_event else 25.0
                 packet_seq_num += 1
 
@@ -433,10 +460,7 @@ class SimulatorManager:
                             node.E_current = max(
                                 0.0, node.E_current - idle_energy)
                             if n_id in self.bs.node_states:
-                                self.bs.node_states[n_id]['idle_sensing_energy_epoch'] = (
-                                    self.bs.node_states[n_id].get(
-                                        'idle_sensing_energy_epoch', 0.0) + idle_energy
-                                )
+                                self.bs.node_states[n_id]['idle_sensing_energy_epoch'] += idle_energy
                             if node.E_current <= 0 and node.status == "ALIVE":
                                 node.status = "DEAD"
                                 self.metrics.record_node_death(
@@ -452,7 +476,7 @@ class SimulatorManager:
             for n_id, node in self.nodes.items():
                 if n_id != self.BS_ID:
                     topology_packet = node.check_route_health(
-                        self.nodes, 40.0, self.current_time)
+                        self.nodes, self.transmission_range, self.current_time)
                     if topology_packet is not None:
                         _trace_control_packet(n_id, topology_packet)
                     control_packet = node.check_inactivity(self.current_time)
@@ -481,15 +505,10 @@ class SimulatorManager:
             self.metrics.update_packet_transmission(
                 is_critical=False, is_control=True, size_bytes=16, overhead_phase='operational')
 
-        if not hasattr(self, 'source_seq_counters'):
-            self.source_seq_counters = defaultdict(int)
         self.source_seq_counters[source_id] += 1
         seq_num = self.source_seq_counters[source_id]
-
-        if not hasattr(self.metrics, '_unique_generated_data_keys'):
-            self.metrics._unique_generated_data_keys = set()
-            self.metrics._unique_delivered_data_keys = set()
         key = (int(source_id), int(seq_num))
+
         if key not in self.metrics._unique_generated_data_keys:
             self.metrics._unique_generated_data_keys.add(key)
             self.metrics.update_packet_transmission(
@@ -508,6 +527,8 @@ class SimulatorManager:
             if not candidate_paths:
                 candidate_paths = [p for p in [
                     table.get('primary_path'), table.get('secondary_path')] if p]
+            self.metrics.record_critical_multipath_opportunity(
+                secondary_available=(len(candidate_paths) >= 2))
             source_risk = self.bs.node_states.get(
                 source_id, {}).get('risk_mean', 0.0)
             max_paths = 2
@@ -565,7 +586,7 @@ class SimulatorManager:
                     break
                 hop_node = self.nodes[current_hop_id]
                 path_log.append(current_hop_id)
-                if hasattr(hop_node, 'is_malicious') and hop_node.is_malicious:
+                if hop_node.is_malicious:
                     packet_dropped = True
                     break
                 next_hop_id = route[idx + 1] if idx + \
@@ -593,6 +614,14 @@ class SimulatorManager:
                 packet_data["path_header"] = path_log
                 self.bs.data_plane_receive(
                     packet_data, path_log, receive_time=self.current_time + simulated_delay)
+
+        if is_critical and self.ablation.get("use_critical_multipath_routing", False):
+            attempted_redundant = max(0, len(paths_to_trace) - 1)
+            accepted_redundant = max(0, delivered_fragments - 1)
+            rejected_redundant = max(
+                0, attempted_redundant - accepted_redundant)
+            self.metrics.critical_redundant_copy_accepted += accepted_redundant
+            self.metrics.critical_redundant_copy_rejected += rejected_redundant
 
         if delivered_fragments >= required_fragments:
             self.metrics.update_packet_transmission(

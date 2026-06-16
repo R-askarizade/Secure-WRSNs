@@ -3,6 +3,7 @@ import time
 import random
 from config import compute_packet_hash, CONTROL_PACKET_BYTES_SMALL, DATA_PACKET_BYTES
 
+
 class SensorNode:
     def __init__(self, node_id, x, y, initial_energy, metrics_collector):
         self.node_id = node_id
@@ -27,6 +28,10 @@ class SensorNode:
         self.last_activity_time = 0.0
 
         self.metrics = metrics_collector
+        self.network_nodes = {}
+        self.is_malicious = False
+        self.sos_sent = False
+        self.control_seq_counter = 0
 
         self.E_elec = 50e-9
         self.eps_fs = 10e-12
@@ -62,14 +67,12 @@ class SensorNode:
         self.last_topology_alert_time = current_time
         return self._send_topology_change(current_time)
 
-    def _phase1_next_control_seq(self):
-        if not hasattr(self, 'control_seq_counter'):
-            self.control_seq_counter = 0
+    def _next_control_seq(self):
         self.control_seq_counter += 1
         return self.control_seq_counter
 
-    def _phase1_finalize_source_control_packet(self, packet):
-        packet.setdefault('seq', self._phase1_next_control_seq())
+    def _finalize_source_control_packet(self, packet):
+        packet.setdefault('seq', self._next_control_seq())
         if self.crypto_keys is not None:
             packet['hash'] = compute_packet_hash(packet, self.crypto_keys)
         return packet
@@ -83,7 +86,7 @@ class SensorNode:
             'size_bytes': CONTROL_PACKET_BYTES_SMALL,
             'energy_trace': [(self.node_id, self.E_current)]
         }
-        self._phase1_finalize_source_control_packet(packet)
+        self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=True)
         self.metrics.update_packet_transmission(
             is_critical=True, is_control=True, size_bytes=CONTROL_PACKET_BYTES_SMALL)
@@ -99,7 +102,7 @@ class SensorNode:
         is_critical = (critical_flag == 1)
 
         reported_energy = self.E_current
-        if hasattr(self, 'is_malicious') and self.is_malicious:
+        if self.is_malicious:
             reported_energy = self.E_max * 0.05
 
         packet = {
@@ -118,9 +121,8 @@ class SensorNode:
         self._reset_inactivity_timer(current_time)
 
     def _distance_to_next_hop(self, next_hop_id, fallback=40.0):
-        nodes = getattr(self, 'network_nodes', None)
-        if nodes is not None and next_hop_id in nodes:
-            other = nodes[next_hop_id]
+        if self.network_nodes and next_hop_id in self.network_nodes:
+            other = self.network_nodes[next_hop_id]
             return math.hypot(self.x - other.x, self.y - other.y)
         return fallback
 
@@ -150,14 +152,14 @@ class SensorNode:
         self._consume_energy(rx_bytes=packet["size_bytes"])
 
         reported_energy = self.E_current
-        if hasattr(self, 'is_malicious') and self.is_malicious:
+        if self.is_malicious:
             reported_energy = self.E_max * 0.05
 
         if "energy_trace" not in packet:
             packet["energy_trace"] = []
         packet["energy_trace"].append((self.node_id, reported_energy))
 
-        if hasattr(self, 'is_malicious') and self.is_malicious:
+        if self.is_malicious:
             if random.random() < 0.50:
                 return False
 
@@ -174,8 +176,8 @@ class SensorNode:
         battery_critical = self.E_current <= self.E_critical
         long_silence = silence_duration >= self.T_max_inactivity
 
-        if hasattr(self, 'is_malicious') and self.is_malicious:
-            if random.random() < 0.05 and not getattr(self, 'sos_sent', False):
+        if self.is_malicious:
+            if random.random() < 0.05 and not self.sos_sent:
                 temp_battery = self.E_current
                 self.E_current = 0.01
                 packet = self._send_sos_charge_request(current_time)
@@ -183,7 +185,7 @@ class SensorNode:
                 self.sos_sent = True
                 return packet
 
-        if battery_critical and long_silence and not getattr(self, 'sos_sent', False):
+        if battery_critical and long_silence and not self.sos_sent:
             self.sos_sent = True
             return self._send_sos_charge_request(current_time)
 
@@ -200,7 +202,7 @@ class SensorNode:
             'size_bytes': CONTROL_PACKET_BYTES_SMALL,
             'energy_trace': [(self.node_id, self.E_current)]
         }
-        self._phase1_finalize_source_control_packet(packet)
+        self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=True)
         self.metrics.update_packet_transmission(
             is_critical=True, is_control=True, size_bytes=CONTROL_PACKET_BYTES_SMALL)
@@ -216,7 +218,7 @@ class SensorNode:
             'size_bytes': CONTROL_PACKET_BYTES_SMALL,
             'energy_trace': [(self.node_id, self.E_current)]
         }
-        self._phase1_finalize_source_control_packet(packet)
+        self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=False)
         self.metrics.update_packet_transmission(
             is_critical=False, is_control=True, size_bytes=CONTROL_PACKET_BYTES_SMALL)
@@ -224,10 +226,6 @@ class SensorNode:
         return packet
 
     def _consume_energy(self, tx_bytes=0, rx_bytes=0, distance=0.0, aggregation=False):
-        if hasattr(self, 'metrics'):
-            self.metrics.current_sim_time = getattr(
-                self.metrics, 'current_sim_time', 0.0)
-
         bits = (tx_bytes + rx_bytes) * 8
         energy = 0.0
 
@@ -249,8 +247,8 @@ class SensorNode:
         if self.E_current <= 0 and self.status == "ALIVE":
             self.E_current = 0
             self.status = "DEAD"
-            self.metrics.record_node_death(self.node_id, getattr(
-                self.metrics, 'current_sim_time', 0.0))
+            self.metrics.record_node_death(
+                self.node_id, self.metrics.current_sim_time)
 
     def receive_wireless_charge(self, injected_energy):
         if self.status == "DEAD":

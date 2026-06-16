@@ -2,11 +2,13 @@ import math
 import networkx as nx
 from config import DATA_PACKET_BITS
 
+
 class BaselineRouting:
     def __init__(self, bs_id, transmission_range=50.0, max_critical_paths=2):
         self.bs_id = bs_id
         self.transmission_range = transmission_range
         self.max_critical_paths = max_critical_paths
+        self.quarantined_zones = []
 
     def build_network_graph(self, active_nodes_dict):
         G = nx.Graph()
@@ -53,7 +55,7 @@ class BaselineRouting:
         G = self.build_network_graph(active_nodes_dict)
         G_dir = nx.DiGraph()
         G_dir.add_nodes_from(G.nodes())
-        quarantined_zones = getattr(self, 'quarantined_zones', [])
+        quarantined_zones = self.quarantined_zones
 
         def _in_quarantine(node_id):
             node = active_nodes_dict.get(node_id)
