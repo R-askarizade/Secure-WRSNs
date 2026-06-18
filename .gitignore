@@ -1,1 +1,6 @@
 /ALL.py
+/Results/*
+/README.md
+/requirements.txt
+/.gitignore
+/__pycache__/

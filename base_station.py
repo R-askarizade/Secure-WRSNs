@@ -319,7 +319,7 @@ class BaseStation:
         W_Hybrid = W_Hybrid_raw / np.sum(W_Hybrid_raw)
         return W_Hybrid
 
-    def _phase_3_1_5_compute_fitness_value(self):
+    def _compute_fitness_value(self):
         nodes = list(self.node_states.keys())
         valid_nodes = [n for n in nodes if n != self.BS_ID]
         dynamic_weights = self._calculate_hybrid_weights(valid_nodes)
@@ -348,17 +348,17 @@ class BaseStation:
             self.control_epoch_index += 1
 
             self._verify_wrsn_cyber_physical_security()
-            self._phase_3_1_two_tier_trust_matrix()
+            self._two_tier_trust_matrix()
             self._verify_stealthy_attackers()
             self._verify_trajectory_manipulators()
 
-            self._phase_3_1_5_compute_fitness_value()
+            self._compute_fitness_value()
 
-            U_malicious_dict = self._phase_3_2_fcm_classification()
-            self._phase_3_2b_calibrated_risk_fusion(U_malicious_dict)
+            U_malicious_dict = self._fcm_classification()
+            self._calibrated_risk_fusion(U_malicious_dict)
 
-            network_clusters = self._phase_3_3_network_clustering()
-            self._phase_3_4_joint_optimization(
+            network_clusters = self._network_clustering()
+            self._joint_optimization(
                 U_malicious_dict, network_clusters)
 
             self.packet_logs.clear()
@@ -467,7 +467,7 @@ class BaseStation:
             self.RISK_HYSTERESIS_EPOCHS = old_h
             self.RISK_WARMUP_EPOCHS = old_w
 
-    def _phase_3_1_two_tier_trust_matrix(self):
+    def _two_tier_trust_matrix(self):
         nodes = list(self.node_states.keys())
         if not nodes:
             return
@@ -831,7 +831,7 @@ class BaseStation:
             state['T5_history'] = t5_new
             state['trust_vector'][4] = t5_new
 
-    def _phase_3_2_fcm_classification(self):
+    def _fcm_classification(self):
         if not self.ablation.get('use_fcm_classification', True):
             out = {}
             for nid, state in self.node_states.items():
@@ -919,7 +919,7 @@ class BaseStation:
             attribution[nid] = max(0.0, fail_contains - fail_excludes)
         return attribution
 
-    def _phase_3_2b_calibrated_risk_fusion(self, U_malicious_dict):
+    def _calibrated_risk_fusion(self, U_malicious_dict):
         if not self.ablation.get('use_uncertainty_calibrated_risk', True):
             for nid, state in self.node_states.items():
                 if nid == self.BS_ID:
@@ -1010,7 +1010,7 @@ class BaseStation:
             else:
                 state['status'] = 'WHITELISTED'
 
-    def _phase_3_3_network_clustering(self):
+    def _network_clustering(self):
         valid_nodes = [nid for nid, state in self.node_states.items(
         ) if state['status'] != 'BLACKLISTED']
         if not valid_nodes:
@@ -1166,7 +1166,7 @@ class BaseStation:
                     node_id, current_t, validated=ok)
         return ok
 
-    def _phase_3_4_joint_optimization(self, U_malicious_dict, network_clusters):
+    def _joint_optimization(self, U_malicious_dict, network_clusters):
         node_penalties = {}
         active_nodes = {}
         shadow_penalties = {}

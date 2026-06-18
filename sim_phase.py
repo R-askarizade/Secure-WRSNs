@@ -213,7 +213,7 @@ def _edgecase_packet(seq=1, packet_type='DATA', priority='NORMAL', energy=0.9, p
     return pkt
 
 
-def run_security_edge_case_validation(output_csv='refined_security_edge_cases_results.csv', verbose=True):
+def run_security_edge_case_validation(output_csv='security_edge_cases_results.csv', verbose=True):
     rows = []
 
     def record(case, passed, expected, observed, details=''):
@@ -598,7 +598,7 @@ def run_self_tests(verbose=True):
 
 def run_statistical_experiments():
     run_mode = os.environ.get(
-        'WRSN_RUN_MODE', 'sweep').strip().lower().replace('-', '_')
+        'WRSN_RUN_MODE', 'all_mode').strip().lower().replace('-', '_')
     aliases = {
         'edge_cases': 'security_edge_cases', 'edge_validation': 'security_edge_cases',
         'security_validation': 'security_edge_cases', 'security_edge_validation': 'security_edge_cases',
@@ -635,7 +635,7 @@ def run_statistical_experiments():
                 seed, scenario_name, SIM_TIME))
 
     df = pd.DataFrame(all_results)
-    prefix = f"refined_security_performance_{safe_mode}"
+    prefix = f"security_performance_{safe_mode}"
     df.to_csv(f'{prefix}_results.csv', index=False)
     summary = summarize_results(df, f'{prefix}_summary_ci.csv')
     make_plots(df, f'plots_{prefix}')
@@ -657,7 +657,7 @@ def run_statistical_experiments():
     security_suite_aliases = {'security_suite'}
     if (normalized_mode in all_mode_aliases or normalized_mode in security_suite_aliases) and os.environ.get('WRSN_SKIP_EDGE_CASES', '0').strip() != '1':
         run_security_edge_case_validation(
-            output_csv=f"refined_security_performance_{normalized_mode}_security_edge_cases.csv", verbose=True)
+            output_csv=f"security_performance_{normalized_mode}_security_edge_cases.csv", verbose=True)
 
     return df, summary
 
