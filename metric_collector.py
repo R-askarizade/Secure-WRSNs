@@ -104,6 +104,20 @@ class MetricsCollector:
         self.raw_sos_validation_attempts = 0
         self.raw_sos_blocked = 0
 
+        # ADAPTIVE QIFL-DQN CHARGING METRICS
+        self.adaptive_charge_thresholds = []
+        self.qifl_training_losses = []
+        self.sos_threshold_energies = []
+        self.charging_kmeans_cluster_counts = []
+        self.charging_cluster_assigned_node_counts = []
+        self.dqn_routing_decisions = 0
+        self.dqn_training_losses = []
+        self.mc_useless_charge_events = 0
+        self.mc_repeated_service_events = 0
+        self.mc_revisit_intervals = []
+        self.ewma_energy_abs_errors = []
+        self.qifl_admission_count = 0
+
     def update_packet_transmission(self, is_critical, is_control, size_bytes, is_delivered=False, delay=None, overhead_phase='operational', count_generated=True):
         if is_control:
             if overhead_phase == 'setup':
@@ -337,6 +351,16 @@ class MetricsCollector:
             'Setup_Overhead_%': self.calculate_overhead_ratio('setup'),
             'Operational_Control_Overhead_%': self.calculate_overhead_ratio('operational'),
             'Total_Protocol_Overhead_%': self.calculate_overhead_ratio('total'),
+            'Mobile_Charger_Count': int(getattr(self, 'mobile_charger_count', 1)),
+            'Mobile_Charger_Capacity_Mode': str(getattr(self, 'mobile_charger_capacity_mode', 'absolute')),
+            'Sensor_Initial_Energy': float(getattr(self, 'sensor_initial_energy', 0.0)),
+            'Mobile_Charger_Total_Capacity': float(getattr(self, 'mobile_charger_total_capacity', 0.0)),
+            'Mobile_Charger_Min_Capacity': float(getattr(self, 'mobile_charger_min_capacity', 0.0)),
+            'Mobile_Charger_Max_Capacity': float(getattr(self, 'mobile_charger_max_capacity', 0.0)),
+            'Mobile_Charger_Total_Sensor_Equivalent_Capacity': float(getattr(self, 'mobile_charger_total_sensor_equivalent_capacity', 0.0)),
+            'Mobile_Charger_Min_Sensor_Equivalent_Capacity': float(getattr(self, 'mobile_charger_min_sensor_equivalent_capacity', 0.0)),
+            'Mobile_Charger_Max_Sensor_Equivalent_Capacity': float(getattr(self, 'mobile_charger_max_sensor_equivalent_capacity', 0.0)),
+            'Mobile_Charger_Avg_Travel_Energy_Cost_Per_M': float(getattr(self, 'mobile_charger_avg_travel_energy_cost_per_m', 0.0)),
             'MC_Travel_Distance': self.mc_travel_distance,
             'MC_Charge_Events': self.mc_charge_events,
             'MC_Total_Injected_Energy': self.mc_total_injected_energy,
@@ -371,6 +395,45 @@ class MetricsCollector:
         summary['MC_Avoided_Node_Deaths'] = self.mc_avoided_node_deaths
         summary['Energy_Critical_Node_Events'] = self.energy_critical_node_events
         summary['Energy_Critical_Node_Deaths'] = self.energy_critical_node_deaths
+
+        # ADAPTIVE QIFL-DQN CHARGING EXPORTS
+        summary['Adaptive_Charge_Threshold_Avg'] = float(np.mean(
+            self.adaptive_charge_thresholds)) if self.adaptive_charge_thresholds else 0.0
+        summary['Adaptive_Charge_Threshold_Max'] = float(np.max(
+            self.adaptive_charge_thresholds)) if self.adaptive_charge_thresholds else 0.0
+        summary['QIFL_Training_Loss_Avg'] = float(
+            np.mean(self.qifl_training_losses)) if self.qifl_training_losses else 0.0
+        summary['SOS_Threshold_Energy_Avg'] = float(
+            np.mean(self.sos_threshold_energies)) if self.sos_threshold_energies else 0.0
+        summary['Charging_KMeans_Clusters_Avg'] = float(np.mean(
+            self.charging_kmeans_cluster_counts)) if self.charging_kmeans_cluster_counts else 0.0
+        summary['Charging_Cluster_Assigned_Nodes_Avg'] = float(np.mean(
+            self.charging_cluster_assigned_node_counts)) if self.charging_cluster_assigned_node_counts else 0.0
+        summary['DQN_Routing_Decisions'] = int(self.dqn_routing_decisions)
+        summary['DQN_Training_Loss_Avg'] = float(
+            np.mean(self.dqn_training_losses)) if self.dqn_training_losses else 0.0
+        summary['MC_Injected_Energy_Per_Charge_Event'] = self._safe_rate(
+            self.mc_total_injected_energy, self.mc_charge_events)
+        summary['MC_Travel_Per_Charged_Joule'] = self._safe_rate(
+            self.mc_travel_distance, self.mc_total_injected_energy)
+        summary['MC_Charge_Events_Per_Critical_Node'] = self._safe_rate(
+            self.mc_charge_events, self.energy_critical_node_events)
+        summary['MC_Deadline_Failure_Rate'] = self._safe_rate(
+            self.mc_missed_charging_deadlines, self.energy_critical_node_events)
+        summary['Energy_Critical_Death_Rate'] = self._safe_rate(
+            self.energy_critical_node_deaths, self.energy_critical_node_events)
+        summary['MC_Useless_Charge_Rate_Heuristic'] = self._safe_rate(
+            self.mc_useless_charge_events, self.mc_charge_events)
+        summary['MC_Repeated_Service_Events'] = int(
+            self.mc_repeated_service_events)
+        summary['MC_Revisit_Interval_Avg'] = float(
+            np.mean(self.mc_revisit_intervals)) if self.mc_revisit_intervals else 0.0
+        summary['EWMA_Energy_Prediction_MAE'] = float(
+            np.mean(self.ewma_energy_abs_errors)) if self.ewma_energy_abs_errors else 0.0
+        summary['QIFL_Admission_Count'] = int(self.qifl_admission_count)
+        summary['QIFL_Learning_Active_Flag'] = 1.0 if summary['QIFL_Training_Loss_Avg'] > 0 else 0.0
+        summary['DQN_Learning_Active_Flag'] = 1.0 if (
+            summary['DQN_Routing_Decisions'] > 0 and summary['DQN_Training_Loss_Avg'] > 0) else 0.0
 
         # INNOVATION AUDIT EXPORTS
         charge_tp = self.charging_decision_tp

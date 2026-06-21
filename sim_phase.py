@@ -11,6 +11,16 @@ from mobile_charger import MobileCharger
 from simulator_manager import SimulatorManager
 
 
+def _env_enabled(name, default='0'):
+    raw = str(os.environ.get(name, default)).strip().lower()
+    if raw in ('', '0', 'false', 'no', 'off', 'none'):
+        return False
+    try:
+        return float(raw) > 0.0
+    except ValueError:
+        return raw in ('true', 'yes', 'on', 'enable', 'enabled')
+
+
 def _base_config():
     return {
         'experiment_family': 'communication_security',
@@ -36,6 +46,53 @@ def _base_config():
         'use_mc_hmac_authentication': True,
         'use_mc_location_verification': True,
         'use_secure_charging_request_validation': True,
+        'use_adaptive_quantum_charging': False,
+        'use_dqn_charger_routing': False,
+        'enable_qifl_learning': True,
+        'energy_ewma_beta': 0.70,
+        'qifl_learning_rate': 5e-3,
+        'dqn_learning_rate': 1e-3,
+        'dqn_max_candidates': 12,
+        'use_gpu_for_adaptive_charging': True,
+        'sos_threshold_margin_ratio': 0.03,
+
+        # Efficiency guards for the adaptive charging framework.
+        'use_charging_hysteresis': True,
+        'minimum_charge_energy_ratio': 0.08,
+        'post_charge_release_ratio': 0.88,
+        'charging_reentry_cooldown_s': 180.0,
+        'qifl_threshold_lower_bound': 0.20,
+        'qifl_threshold_upper_bound': 0.52,
+        'qifl_sos_threshold_upper_bound': 0.90,
+        'minimum_cluster_charge_gap_ratio': 0.05,
+        'penalize_repeated_mc_visits': True,
+        'dqn_reward_travel_weight': 1.0,
+        'dqn_reward_energy_weight': 1.0,
+        'dqn_reward_deadline_weight': 2.0,
+        'dqn_reward_revisit_penalty': 2.0,
+        'use_travel_aware_admission': True,
+        'travel_admission_lambda': 2.0,
+        'travel_admission_gate': 0.10,
+        'hard_deadline_margin_s': 90.0,
+        'use_deadline_safe_energy_sentinel': True,
+
+        'mobile_charger_selection_mode': 'hardcoded',
+        'num_mobile_chargers': 1,
+
+        'mobile_charger_capacity_mode': 'absolute',
+        'mobile_charger_capacity': 50000.0,
+        'mobile_charger_capacities': [50000.0],
+        'mobile_charger_sensor_equivalent_capacity': 20.0,
+        'mobile_charger_sensor_equivalent_capacities': [20.0],
+        'mobile_charger_travel_cost_mode': 'absolute',
+        'mobile_charger_travel_energy_cost_per_m': 0.1,
+        'mobile_charger_travel_sensor_equivalent_cost_per_m': 0.0005,
+        'mobile_charger_speed': 5.0,
+        'mobile_charger_speeds': [5.0],
+        'mobile_charger_nodes_per_charger': 40,
+        'min_mobile_chargers': 1,
+        'max_mobile_chargers': 8,
+
         'enable_network_layer_ack': False,
         'enable_periodic_hello': False,
         'route_recompute_period': None,
@@ -61,7 +118,7 @@ def _scenarios_for_mode(mode):
     mode = (mode or 'main').strip().lower().replace('-', '_')
     aliases = {
         'physical': 'physical_compromise', 'tpm': 'physical_compromise', 'tpm_compromise': 'physical_compromise',
-        'mc': 'energy', 'mobile_charging': 'energy', 'charging': 'energy',
+        'mc': 'charging_suite', 'mobile_charging': 'charging_suite', 'charging': 'charging_suite',
         'all': 'all_modes', 'full': 'all_modes', 'full_suite': 'all_modes', 'everything': 'all_modes',
         'complete': 'all_modes', 'complete_suite': 'all_modes',
         'sweep': 'parameter_sweep', 'stress': 'parameter_sweep', 'parameter': 'parameter_sweep',
@@ -81,30 +138,147 @@ def _scenarios_for_mode(mode):
             'charge_need_ratio': 0.80,
             'charge_claim_est_max_deviation': 1.00,
             'allow_energy_stress_predictive_charging': True,
+            'use_adaptive_quantum_charging': True,
+            'use_dqn_charger_routing': True,
+            'use_charging_hysteresis': True,
+            'use_adaptive_charge_guards': True,
+            'minimum_charge_energy_ratio': 0.08,
+            'post_charge_release_ratio': 0.88,
+            'charging_reentry_cooldown_s': 180.0,
+            'qifl_threshold_lower_bound': 0.20,
+            'qifl_threshold_upper_bound': 0.52,
         })
-        return [('EnergyStress_MC_Security', c)]
+        return [('EnergyStress_QIFL_DQN_Guarded', c)]
 
     def get_mc_ablation():
         out = []
 
+        guarded_defaults = {
+            'experiment_family': 'energy_charging_stress',
+            'enable_energy_experiment': True,
+            'initial_energy_override': 0.018,
+            'event_rate_lambda': 1.2,
+            'idle_sensing_power_j_per_s': 2.5e-6,
+            'allow_energy_stress_predictive_charging': True,
+            'charge_need_ratio': 0.80,
+            'charge_claim_est_max_deviation': 1.00,
+            'use_charging_hysteresis': True,
+            'use_adaptive_charge_guards': True,
+            'minimum_charge_energy_ratio': 0.08,
+            'post_charge_release_ratio': 0.88,
+            'charging_reentry_cooldown_s': 180.0,
+            'qifl_threshold_lower_bound': 0.20,
+            'qifl_threshold_upper_bound': 0.52,
+            'qifl_sos_threshold_upper_bound': 0.90,
+            'minimum_cluster_charge_gap_ratio': 0.05,
+            'penalize_repeated_mc_visits': True,
+        }
+
         def add(name, **changes):
             c = dict(base)
-            c.update({
-                'experiment_family': 'energy_charging_stress',
-                'enable_energy_experiment': True,
-                'initial_energy_override': 0.018,
-                'event_rate_lambda': 1.2,
-                'idle_sensing_power_j_per_s': 2.5e-6,
-            })
+            c.update(guarded_defaults)
             c.update(changes)
             out.append((name, c))
-        add('MC_Full_Security')
-        add('MC_No_HMAC', use_mc_hmac_authentication=False)
-        add('MC_No_Location_Check', use_mc_location_verification=False)
+
+        # Main proposed method after efficiency guards.
+        add('MC_Full_QIFL_DQN',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True)
+
+        # Backward-compatible name used by your previous tables.
+        add('MC_Full_Security',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True)
+
+        if _env_enabled('WRSN_ENABLE_MULTI_MC_SCENARIOS'):
+            add('MC_Full_QIFL_DQN_MultiMC_Hardcoded',
+                use_adaptive_quantum_charging=True,
+                use_dqn_charger_routing=True,
+                mobile_charger_selection_mode='hardcoded',
+                mobile_charger_capacity_mode='relative',
+                mobile_charger_travel_cost_mode='relative',
+                num_mobile_chargers=3,
+                mobile_charger_sensor_equivalent_capacities=[
+                    100.0, 80.0, 60.0],
+                mobile_charger_travel_sensor_equivalent_cost_per_m=0.0005,
+                mobile_charger_speeds=[5.0, 5.0, 5.0],
+                use_relative_mc_feasibility_guard=True,
+                max_adaptive_charge_queue=18)
+            add('MC_Full_QIFL_DQN_MultiMC_Dynamic',
+                use_adaptive_quantum_charging=True,
+                use_dqn_charger_routing=True,
+                mobile_charger_selection_mode='dynamic',
+                mobile_charger_capacity_mode='relative',
+                mobile_charger_travel_cost_mode='relative',
+                mobile_charger_nodes_per_charger=8,
+                min_mobile_chargers=2,
+                max_mobile_chargers=4,
+                mobile_charger_sensor_equivalent_capacities=[
+                    100.0, 80.0, 60.0, 45.0],
+                mobile_charger_travel_sensor_equivalent_cost_per_m=0.0005,
+                use_relative_mc_feasibility_guard=True,
+                max_adaptive_charge_queue=18)
+
+        if _env_enabled('WRSN_ENABLE_MC_COUNT_SWEEP'):
+            for mc_count in (1, 2, 3, 4):
+                add(f'MC_Full_QIFL_DQN_{mc_count}MC_RelCap',
+                    use_adaptive_quantum_charging=True,
+                    use_dqn_charger_routing=True,
+                    mobile_charger_selection_mode='hardcoded',
+                    mobile_charger_capacity_mode='relative',
+                    mobile_charger_travel_cost_mode='relative',
+                    num_mobile_chargers=mc_count,
+                    mobile_charger_sensor_equivalent_capacities=[
+                        80.0] * mc_count,
+                    mobile_charger_travel_sensor_equivalent_cost_per_m=0.0005,
+                    mobile_charger_speeds=[5.0] * mc_count,
+                    use_relative_mc_feasibility_guard=True,
+                    max_adaptive_charge_queue=max(18, mc_count * 5))
+
+        # Isolate the contribution of each new module.
+        add('MC_QIFL_Only',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=False)
+        add('MC_DQN_Only',
+            use_adaptive_quantum_charging=False,
+            use_dqn_charger_routing=True)
+        add('MC_No_QIFL_DQN',
+            use_adaptive_quantum_charging=False,
+            use_dqn_charger_routing=False,
+            use_adaptive_charge_guards=False)
+
+        # Guard ablation: proves whether hysteresis/cooldown/minimum charge solve
+        add('MC_QIFL_DQN_No_Guards',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_adaptive_charge_guards=False,
+            use_charging_hysteresis=False,
+            minimum_charge_energy_ratio=0.0,
+            charging_reentry_cooldown_s=0.0,
+            qifl_threshold_upper_bound=0.90,
+            minimum_cluster_charge_gap_ratio=0.0,
+            penalize_repeated_mc_visits=False)
+
+        add('MC_No_HMAC',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_mc_hmac_authentication=False)
+        add('MC_No_Location_Check',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_mc_location_verification=False)
         add('MC_Raw_SOS_No_Validation',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
             use_secure_charging_request_validation=False)
-        add('MC_No_SED', use_sed_filter=False)
-        add('MC_No_Deviation_Filter', use_zero_overhead_spoof_detection=False)
+        add('MC_No_SED',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_sed_filter=False)
+        add('MC_No_Deviation_Filter',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_zero_overhead_spoof_detection=False)
         return out
 
     def get_ablation():
@@ -163,7 +337,7 @@ def _scenarios_for_mode(mode):
         return _physical_compromise_scenarios()
     if mode == 'security_suite':
         return [('Phase1_Method', base)] + get_ablation()
-    if mode in ('charging_suite', 'energy_suite', 'mc_suite'):
+    if mode in ('charging_suite', 'energy_suite', 'mc_suite', 'charging_ablation'):
         return get_energy() + get_mc_ablation()
     if mode == 'all_modes':
         return [('Phase1_Method', base)] + get_ablation() + get_energy() + get_mc_ablation() + _physical_compromise_scenarios()
@@ -588,17 +762,104 @@ def run_self_tests(verbose=True):
     assert bs.validate_charging_request(
         1, emergency=True), 'configured charge_claim_est_max_deviation was ignored'
 
+    rel_cfg = dict(_base_config())
+    rel_cfg.update({
+        'initial_energy_override': 0.01,
+        'num_mobile_chargers': 2,
+        'mobile_charger_capacity_mode': 'relative',
+        'mobile_charger_sensor_equivalent_capacities': [20.0, 10.0],
+        'mobile_charger_travel_cost_mode': 'relative',
+        'mobile_charger_travel_sensor_equivalent_cost_per_m': 0.0005,
+    })
+    rel_sim = SimulatorManager(
+        num_nodes=3, sim_time=10, ablation_config=rel_cfg, seed=1)
+    rel_caps = [mc.E_capacity for mc in rel_sim.mobile_chargers]
+    assert len(rel_caps) == 2, 'relative capacity test did not create two MCs'
+    assert abs(rel_caps[0] - 0.20) < 1e-12 and abs(rel_caps[1] - 0.10) < 1e-12, \
+        f'relative MC capacity scaling failed: {rel_caps}'
+    assert abs(rel_sim.metrics.mobile_charger_total_sensor_equivalent_capacity - 30.0) < 1e-12, \
+        'sensor-equivalent capacity metric is wrong'
+    assert abs(rel_sim.mobile_chargers[0].travel_energy_cost_per_m - 0.000005) < 1e-12, \
+        'relative MC travel cost scaling failed'
+
+    legacy_cfg = dict(_base_config())
+    legacy_sim = SimulatorManager(
+        num_nodes=3, sim_time=10, ablation_config=legacy_cfg, seed=1)
+    assert len(
+        legacy_sim.mobile_chargers) == 1, 'legacy default should keep one MC'
+    assert abs(legacy_sim.mobile_chargers[0].E_capacity - 50000.0) < 1e-12, \
+        'legacy absolute MC capacity default changed'
+
     row = metrics.export_summary(1, 'unit', 10)
     assert row['Packet_HMAC_Failures'] >= 1, 'Packet_HMAC_Failures not exported'
     assert row['Source_Sequence_Replay_Events'] >= 1, 'Source_Sequence_Replay_Events not exported'
+    assert row['Mobile_Charger_Capacity_Mode'] == 'absolute', 'capacity mode not exported'
     if verbose:
         print('[SELF-TEST] Phase-1 coherence V3 self-tests passed.')
+        print('[SELF-TEST] Relative MC capacity scaling passed.')
     return ok
+
+
+def _safe_div(num, den):
+    try:
+        den = float(den)
+        if den == 0.0:
+            return 0.0
+        return float(num) / den
+    except Exception:
+        return 0.0
+
+
+def _add_charging_efficiency_diagnostics(df):
+    if df is None or df.empty:
+        return df
+
+    df = df.copy()
+    zeros = pd.Series(0.0, index=df.index)
+
+    charge_events = df.get('MC_Charge_Events', zeros).astype(float)
+    injected = df.get('MC_Total_Injected_Energy', zeros).astype(float)
+    travel = df.get('MC_Travel_Distance', zeros).astype(float)
+    deadlines_missed = df.get(
+        'MC_Missed_Charging_Deadlines', zeros).astype(float)
+    deaths = df.get('Energy_Critical_Node_Deaths', zeros).astype(float)
+    critical_events = df.get(
+        'Energy_Critical_Node_Events', zeros).astype(float)
+    dqn_decisions = df.get('DQN_Routing_Decisions', zeros).astype(float)
+    qifl_loss = df.get('QIFL_Training_Loss_Avg', zeros).astype(float)
+    dqn_loss = df.get('DQN_Training_Loss_Avg', zeros).astype(float)
+
+    df['MC_Injected_Energy_Per_Charge_Event'] = [
+        _safe_div(e, c) for e, c in zip(injected, charge_events)
+    ]
+    df['MC_Travel_Per_Charged_Joule'] = [
+        _safe_div(t, e) for t, e in zip(travel, injected)
+    ]
+    df['MC_Charge_Events_Per_Critical_Node'] = [
+        _safe_div(c, max(1.0, ce)) for c, ce in zip(charge_events, critical_events)
+    ]
+    df['MC_Deadline_Failure_Rate'] = [
+        _safe_div(m, max(1.0, ce)) for m, ce in zip(deadlines_missed, critical_events)
+    ]
+    df['Energy_Critical_Death_Rate'] = [
+        _safe_div(d, max(1.0, ce)) for d, ce in zip(deaths, critical_events)
+    ]
+
+    df['MC_Useless_Charge_Rate_Heuristic'] = [
+        1.0 if (c > 0 and _safe_div(e, c) < 1e-3) else 0.0
+        for e, c in zip(injected, charge_events)
+    ]
+
+    df['QIFL_Learning_Active_Flag'] = [
+        1.0 if x > 0 else 0.0 for x in qifl_loss]
+    df['DQN_Learning_Active_Flag'] = [1.0 if (d > 0 and l > 0) else 0.0
+                                      for d, l in zip(dqn_decisions, dqn_loss)]
+    return df
 
 
 def run_statistical_experiments():
     run_mode = os.environ.get(
-        'WRSN_RUN_MODE', 'all_mode').strip().lower().replace('-', '_')
+        'WRSN_RUN_MODE', 'charging_suite').strip().lower().replace('-', '_')
     aliases = {
         'edge_cases': 'security_edge_cases', 'edge_validation': 'security_edge_cases',
         'security_validation': 'security_edge_cases', 'security_edge_validation': 'security_edge_cases',
@@ -635,6 +896,7 @@ def run_statistical_experiments():
                 seed, scenario_name, SIM_TIME))
 
     df = pd.DataFrame(all_results)
+    df = _add_charging_efficiency_diagnostics(df)
     prefix = f"security_performance_{safe_mode}"
     df.to_csv(f'{prefix}_results.csv', index=False)
     summary = summarize_results(df, f'{prefix}_summary_ci.csv')
@@ -644,7 +906,14 @@ def run_statistical_experiments():
 
     keep = [c for c in ['Ablation_Scenario', 'N', 'TPR_Mean', 'FPR_Mean', 'Accuracy_Mean', 'F1_Score_Mean',
                         'Overall_PDR_Mean', 'Critical_PDR_Mean', 'Throughput_Mean', 'Avg_Delay_Mean',
-                        'Operational_Control_Overhead_%_Mean', 'MC_Travel_Distance_Mean',
+                        'Operational_Control_Overhead_%_Mean', 'Mobile_Charger_Count_Mean',
+                        'Sensor_Initial_Energy_Mean', 'Mobile_Charger_Total_Capacity_Mean',
+                        'Mobile_Charger_Total_Sensor_Equivalent_Capacity_Mean',
+                        'Mobile_Charger_Avg_Travel_Energy_Cost_Per_M_Mean', 'MC_Travel_Distance_Mean',
+                        'MC_Injected_Energy_Per_Charge_Event_Mean', 'MC_Travel_Per_Charged_Joule_Mean',
+                        'MC_Charge_Events_Per_Critical_Node_Mean', 'MC_Deadline_Failure_Rate_Mean',
+                        'Energy_Critical_Death_Rate_Mean', 'MC_Useless_Charge_Rate_Heuristic_Mean',
+                        'QIFL_Learning_Active_Flag_Mean', 'DQN_Learning_Active_Flag_Mean',
                         'Charging_Decision_Accuracy_Mean', 'Silent_Node_Rescue_Rate_Mean',
                         'Delay_Attribution_Accuracy_Mean', 'Tomography_Observability_Ratio_Mean',
                         'Shadow_Route_Hit_Rate_Mean', 'Critical_Secondary_Path_Availability_Rate_Mean',
@@ -663,6 +932,8 @@ def run_statistical_experiments():
 
 
 if __name__ == '__main__':
+    os.environ['WRSN_ENABLE_MULTI_MC_SCENARIOS'] = '2'
+    os.environ['WRSN_ENABLE_MC_COUNT_SWEEP'] = '1'
     if os.environ.get('WRSN_RUN_SELF_TESTS', '0').strip() == '1':
         run_self_tests(verbose=True)
     run_statistical_experiments()
