@@ -125,7 +125,10 @@ def make_plots(df, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     metrics = ['TPR', 'FPR', 'Accuracy', 'Precision', 'Recall', 'F1_Score', 'MCC',
                'Fuzzy_Silhouette_Avg', 'Fuzzy_Partition_Coefficient_Avg', 'Fuzzy_Partition_Entropy_Avg',
-               'Xie_Beni_Avg', 'Operational_Control_Overhead_%', 'Avg_Delay']
+               'Xie_Beni_Avg', 'Operational_Control_Overhead_%', 'Avg_Delay',
+               'QIFL_MinGap_Conflict_Rejections',
+               'QIFL_MinGap_Conflict_Preserved',
+               'Verified_Emergency_Security_Override_Count']
     if os.environ.get('WRSN_FAST_PLOTS', '0').strip() != '1':
         metrics.extend(['Balanced_Accuracy', 'Overall_PDR', 'Critical_PDR', 'Throughput',
                         'Setup_Overhead_%', 'Total_Protocol_Overhead_%', 'MC_Travel_Distance',

@@ -1,4 +1,6 @@
 import math
+import json
+import re
 import numpy as np
 import pandas as pd
 
@@ -66,7 +68,7 @@ class MetricsCollector:
         self.source_sequence_replay_events = 0
         self.packet_hmac_failures = 0
 
-        # INNOVATION AUDIT METRICS  
+        # INNOVATION AUDIT METRICS
         self.charging_decision_tp = 0
         self.charging_decision_fp = 0
         self.charging_decision_tn = 0
@@ -111,12 +113,40 @@ class MetricsCollector:
         self.charging_kmeans_cluster_counts = []
         self.charging_cluster_assigned_node_counts = []
         self.dqn_routing_decisions = 0
+        self.dqn_competitive_decisions = 0
+        self.dqn_single_candidate_decisions = 0
+        self.dqn_effective_exploration_count = 0
+        self.dqn_safety_override_count = 0
         self.dqn_training_losses = []
+        self.dqn_rewards = []
+        self.dqn_reward_energy_components = []
+        self.dqn_reward_deadline_components = []
+        self.dqn_reward_travel_components = []
+        self.dqn_reward_revisit_components = []
+        self.adaptive_hyperparameters = {}
+        self.dynamic_trust_weights_history = []
+        self.mc_service_durations = []
+        self.mc_fail_closed_rejections = 0
+        self.experiment_parameters = {}
+        self.adaptive_compute_device = 'numpy'
+        self.dqn_torch_enabled = False
+        self.qifl_torch_enabled = False
+        self.cuda_available = False
         self.mc_useless_charge_events = 0
         self.mc_repeated_service_events = 0
+        self.mc_total_revisit_events = 0
         self.mc_revisit_intervals = []
+        self.adaptive_minimum_charge_ratios = []
+        self.mc_applied_minimum_charge_ratios = []
         self.ewma_energy_abs_errors = []
         self.qifl_admission_count = 0
+
+        # THREE-VERSION ENERGY-STRESS ABLATION METRICS
+        # These counters isolate only the behavioral differences between V1,
+        # V2, and the final V3 policy.
+        self.qifl_min_gap_conflict_rejections = 0
+        self.qifl_min_gap_conflict_preserved = 0
+        self.verified_emergency_security_override_count = 0
 
     def update_packet_transmission(self, is_critical, is_control, size_bytes, is_delivered=False, delay=None, overhead_phase='operational', count_generated=True):
         if is_control:
@@ -156,7 +186,11 @@ class MetricsCollector:
             self._critical_nodes_seen.discard(node_id)
 
     def record_energy_state(self, current_avg_energy):
-        self.network_residual_energy_history.append(current_avg_energy)
+        # Residual physical energy cannot be negative. Clamping here also makes
+        # exported aggregates robust to stale values from legacy runs.
+        self.network_residual_energy_history.append(
+            max(0.0, float(current_avg_energy))
+        )
 
     def add_mc_travel_distance(self, distance):
         self.mc_travel_distance += distance
@@ -410,8 +444,45 @@ class MetricsCollector:
         summary['Charging_Cluster_Assigned_Nodes_Avg'] = float(np.mean(
             self.charging_cluster_assigned_node_counts)) if self.charging_cluster_assigned_node_counts else 0.0
         summary['DQN_Routing_Decisions'] = int(self.dqn_routing_decisions)
+        summary['DQN_Competitive_Decisions'] = int(
+            self.dqn_competitive_decisions)
+        summary['DQN_Single_Candidate_Decisions'] = int(
+            self.dqn_single_candidate_decisions)
+        summary['DQN_Effective_Exploration_Count'] = int(
+            self.dqn_effective_exploration_count)
+        summary['DQN_Safety_Override_Count'] = int(
+            self.dqn_safety_override_count)
+        for key, value in self.adaptive_hyperparameters.items():
+            summary[f'AdaptiveHP_{key}'] = value
         summary['DQN_Training_Loss_Avg'] = float(
             np.mean(self.dqn_training_losses)) if self.dqn_training_losses else 0.0
+        summary['DQN_Reward_Avg'] = float(
+            np.mean(self.dqn_rewards)) if self.dqn_rewards else 0.0
+        summary['DQN_Reward_Energy_Component_Avg'] = float(
+            np.mean(self.dqn_reward_energy_components)) if self.dqn_reward_energy_components else 0.0
+        summary['DQN_Reward_Deadline_Component_Avg'] = float(
+            np.mean(self.dqn_reward_deadline_components)) if self.dqn_reward_deadline_components else 0.0
+        summary['DQN_Reward_Travel_Component_Avg'] = float(
+            np.mean(self.dqn_reward_travel_components)) if self.dqn_reward_travel_components else 0.0
+        summary['DQN_Reward_Revisit_Component_Avg'] = float(
+            np.mean(self.dqn_reward_revisit_components)) if self.dqn_reward_revisit_components else 0.0
+        summary['MC_Service_Duration_Avg'] = float(
+            np.mean(self.mc_service_durations)) if self.mc_service_durations else 0.0
+        summary['MC_Fail_Closed_Rejections'] = int(
+            self.mc_fail_closed_rejections)
+        if self.dynamic_trust_weights_history:
+            weight_matrix = np.asarray(
+                self.dynamic_trust_weights_history, dtype=float)
+            for index in range(min(5, weight_matrix.shape[1])):
+                summary[f'Dynamic_Trust_Weight_T{index + 1}_Avg'] = float(
+                    np.mean(weight_matrix[:, index]))
+        else:
+            for index in range(5):
+                summary[f'Dynamic_Trust_Weight_T{index + 1}_Avg'] = 0.0
+        summary['Adaptive_Compute_Device'] = str(self.adaptive_compute_device)
+        summary['CUDA_Available_Flag'] = 1.0 if self.cuda_available else 0.0
+        summary['DQN_Torch_Enabled_Flag'] = 1.0 if self.dqn_torch_enabled else 0.0
+        summary['QIFL_Torch_Enabled_Flag'] = 1.0 if self.qifl_torch_enabled else 0.0
         summary['MC_Injected_Energy_Per_Charge_Event'] = self._safe_rate(
             self.mc_total_injected_energy, self.mc_charge_events)
         summary['MC_Travel_Per_Charged_Joule'] = self._safe_rate(
@@ -426,11 +497,31 @@ class MetricsCollector:
             self.mc_useless_charge_events, self.mc_charge_events)
         summary['MC_Repeated_Service_Events'] = int(
             self.mc_repeated_service_events)
+        summary['MC_Total_Revisit_Events'] = int(self.mc_total_revisit_events)
         summary['MC_Revisit_Interval_Avg'] = float(
             np.mean(self.mc_revisit_intervals)) if self.mc_revisit_intervals else 0.0
         summary['EWMA_Energy_Prediction_MAE'] = float(
             np.mean(self.ewma_energy_abs_errors)) if self.ewma_energy_abs_errors else 0.0
+        applied_min_ratios = (
+            self.mc_applied_minimum_charge_ratios
+            if self.mc_applied_minimum_charge_ratios
+            else self.adaptive_minimum_charge_ratios
+        )
+        summary['MC_Useless_Charge_Min_Useful_Ratio'] = float(
+            np.mean(applied_min_ratios)) if applied_min_ratios else 0.0
+        summary['Adaptive_Minimum_Charge_Ratio_Avg'] = float(
+            np.mean(self.adaptive_minimum_charge_ratios)
+        ) if self.adaptive_minimum_charge_ratios else 0.0
         summary['QIFL_Admission_Count'] = int(self.qifl_admission_count)
+        summary['QIFL_MinGap_Conflict_Rejections'] = int(
+            self.qifl_min_gap_conflict_rejections
+        )
+        summary['QIFL_MinGap_Conflict_Preserved'] = int(
+            self.qifl_min_gap_conflict_preserved
+        )
+        summary['Verified_Emergency_Security_Override_Count'] = int(
+            self.verified_emergency_security_override_count
+        )
         summary['QIFL_Learning_Active_Flag'] = 1.0 if summary['QIFL_Training_Loss_Avg'] > 0 else 0.0
         summary['DQN_Learning_Active_Flag'] = 1.0 if (
             summary['DQN_Routing_Decisions'] > 0 and summary['DQN_Training_Loss_Avg'] > 0) else 0.0
@@ -501,6 +592,24 @@ class MetricsCollector:
         summary['Critical_Redundant_Copy_Accepted_Count'] = self.critical_redundant_copy_accepted
         summary['Critical_Redundant_Copy_Rejected_Count'] = self.critical_redundant_copy_rejected
         summary['Sparse_Topology_NoBackup_Count'] = self.sparse_topology_no_backup_count
+
+        # Export the complete resolved scenario configuration. Numeric and
+        # boolean values are included in CI summaries; structured values are
+        # serialized in the raw result CSV for exact reproducibility.
+        for key, value in sorted(self.experiment_parameters.items()):
+            safe_key = re.sub(r'[^0-9A-Za-z_]+', '_', str(key)).strip('_')
+            column = f'Config_{safe_key}'
+            if isinstance(value, (bool, np.bool_)):
+                summary[column] = int(value)
+            elif isinstance(value, (int, float, np.integer, np.floating)):
+                summary[column] = float(value)
+            elif value is None:
+                summary[column] = 'None'
+            elif isinstance(value, (list, tuple, dict, set)):
+                summary[column] = json.dumps(
+                    value, sort_keys=True, default=str)
+            else:
+                summary[column] = str(value)
 
         return summary
 

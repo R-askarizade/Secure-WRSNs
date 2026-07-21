@@ -5,7 +5,7 @@ from config import compute_packet_hash, CONTROL_PACKET_BYTES_SMALL, DATA_PACKET_
 
 
 class SensorNode:
-    def __init__(self, node_id, x, y, initial_energy, metrics_collector):
+    def __init__(self, node_id, x, y, initial_energy, metrics_collector, data_packet_bytes=DATA_PACKET_BYTES):
         self.node_id = node_id
         self.x = x
         self.y = y
@@ -28,6 +28,7 @@ class SensorNode:
         self.last_activity_time = 0.0
 
         self.metrics = metrics_collector
+        self.data_packet_bytes = max(1, int(data_packet_bytes))
         self.network_nodes = {}
         self.is_malicious = False
         self.sos_sent = False
@@ -111,7 +112,7 @@ class SensorNode:
             "priority": "HIGH" if is_critical else "NORMAL",
             "payload": raw_data_value,
             "timestamp": current_time,
-            "size_bytes": DATA_PACKET_BYTES,
+            "size_bytes": self.data_packet_bytes,
             "energy_trace": [(self.node_id, reported_energy)]
         }
 
@@ -243,9 +244,11 @@ class SensorNode:
         if aggregation:
             energy += bits * self.E_DA
 
-        self.E_current -= energy
-        if self.E_current <= 0 and self.status == "ALIVE":
-            self.E_current = 0
+        if self.status == "DEAD":
+            return
+        previous_energy = max(0.0, float(self.E_current))
+        self.E_current = max(0.0, previous_energy - max(0.0, float(energy)))
+        if self.E_current <= 0.0 and self.status == "ALIVE":
             self.status = "DEAD"
             self.metrics.record_node_death(
                 self.node_id, self.metrics.current_sim_time)
@@ -253,9 +256,10 @@ class SensorNode:
     def receive_wireless_charge(self, injected_energy):
         if self.status == "DEAD":
             self.status = "ALIVE"
-        self.E_current += injected_energy
-        if self.E_current > self.E_max:
-            self.E_current = self.E_max
+        self.E_current = min(
+            float(self.E_max),
+            max(0.0, float(self.E_current)) + max(0.0, float(injected_energy)),
+        )
         self.sos_sent = False
 
     def _reset_inactivity_timer(self, current_time):

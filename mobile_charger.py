@@ -36,7 +36,7 @@ class MobileCharger:
             self.x, self.y, target_node.x, target_node.y)
         travel_time = distance / self.speed
         energy_consumed = distance * self.travel_energy_cost_per_m
-        self.E_current -= energy_consumed
+        self.E_current = max(0.0, self.E_current - energy_consumed)
         self.x = target_node.x
         self.y = target_node.y
         self.metrics.add_mc_travel_distance(distance)
@@ -63,7 +63,7 @@ class MobileCharger:
         distance = self._calculate_distance(
             self.x, self.y, self.depot_x, self.depot_y)
         travel_time = distance / self.speed
-        self.E_current -= (distance * self.travel_energy_cost_per_m)
+        self.E_current = max(0.0, self.E_current - (distance * self.travel_energy_cost_per_m))
         self.x = self.depot_x
         self.y = self.depot_y
         self.metrics.add_mc_travel_distance(distance)
@@ -88,7 +88,7 @@ class MobileCharger:
             return 0
 
         target_node.receive_wireless_charge(injected_energy)
-        self.E_current -= injected_energy
+        self.E_current = max(0.0, self.E_current - injected_energy)
         charging_time = injected_energy / self.charging_rate
 
         self.bs.verify_charging_location(target_node.node_id, self.x, self.y)

@@ -4,11 +4,12 @@ from config import DATA_PACKET_BITS
 
 
 class BaselineRouting:
-    def __init__(self, bs_id, transmission_range=50.0, max_critical_paths=2):
+    def __init__(self, bs_id, transmission_range=50.0, max_critical_paths=2, data_packet_bits=4000):
         self.bs_id = bs_id
         self.transmission_range = transmission_range
         self.max_critical_paths = max_critical_paths
         self.quarantined_zones = []
+        self.data_packet_bits = data_packet_bits
 
     def build_network_graph(self, active_nodes_dict):
         G = nx.Graph()
