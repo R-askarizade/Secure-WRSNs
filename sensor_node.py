@@ -5,8 +5,15 @@ from config import compute_packet_hash, CONTROL_PACKET_BYTES_SMALL, DATA_PACKET_
 
 
 class SensorNode:
-    def __init__(self, node_id, x, y, initial_energy, metrics_collector, data_packet_bytes=DATA_PACKET_BYTES):
+    def __init__(self, node_id, x, y, initial_energy, metrics_collector, data_packet_bytes=DATA_PACKET_BYTES, rng_seed=None,
+                 data_packet_bits=None, control_packet_bits=None,
+                 radio_e_elec_j_per_bit=50e-9,
+                 radio_eps_fs_j_per_bit_m2=10e-12,
+                 radio_eps_mp_j_per_bit_m4=0.0013e-12,
+                 radio_e_da_j_per_bit=5e-9):
         self.node_id = node_id
+        self.rng = random.Random(
+            int(node_id if rng_seed is None else rng_seed))
         self.x = x
         self.y = y
         self.crypto_keys = None
@@ -21,6 +28,11 @@ class SensorNode:
 
         self.primary_next_hop = None
         self.secondary_next_hop = None
+        # DATA-plane routes are separate from the original control/charging
+        # routes.  This prevents clustered routing from changing SOS/control
+        # energy or any mobile-charger decision input.
+        self.data_primary_next_hop = None
+        self.data_secondary_next_hop = None
         self.adaptive_threshold = float('inf')
 
         self.inactivity_timer = 0
@@ -29,22 +41,38 @@ class SensorNode:
 
         self.metrics = metrics_collector
         self.data_packet_bytes = max(1, int(data_packet_bytes))
+        self.data_packet_bits = max(1.0, float(
+            self.data_packet_bytes * 8 if data_packet_bits is None else data_packet_bits))
+        self.control_packet_bits = max(1.0, float(
+            CONTROL_PACKET_BYTES_SMALL * 8 if control_packet_bits is None else control_packet_bits))
+        self.control_packet_bytes = max(
+            1, int(math.ceil(self.control_packet_bits / 8.0)))
         self.network_nodes = {}
         self.is_malicious = False
         self.sos_sent = False
         self.control_seq_counter = 0
 
-        self.E_elec = 50e-9
-        self.eps_fs = 10e-12
-        self.eps_mp = 0.0013e-12
-        self.E_DA = 5e-9
+        self.E_elec = max(0.0, float(radio_e_elec_j_per_bit))
+        self.eps_fs = max(0.0, float(radio_eps_fs_j_per_bit_m2))
+        self.eps_mp = max(1e-30, float(radio_eps_mp_j_per_bit_m4))
+        self.E_DA = max(0.0, float(radio_e_da_j_per_bit))
         self.d0 = math.sqrt(self.eps_fs / self.eps_mp)
 
         self.last_topology_alert_time = -float('inf')
         self.topology_alert_cooldown = 300.0
         self.last_bad_next_hop = None
 
+        # ---------------------------------------------------------
+        # Hybrid Fixed Charger Properties
+        # ---------------------------------------------------------
+        self.has_fixed_charger = False
+        self.last_trickle_time = None
+        self.cached_tx_range = 40.0
+
     def check_route_health(self, nodes, tx_range, current_time):
+        # Cache the tx_range for fixed charger self-discovery
+        self.cached_tx_range = float(tx_range)
+
         if self.primary_next_hop is None:
             return None
 
@@ -84,13 +112,15 @@ class SensorNode:
             'type': 'TOPOLOGY_CHANGE',
             'priority': 'HIGH',
             'timestamp': current_time,
-            'size_bytes': CONTROL_PACKET_BYTES_SMALL,
+            'size_bytes': self.control_packet_bytes,
+            'size_bits': self.control_packet_bits,
             'energy_trace': [(self.node_id, self.E_current)]
         }
         self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=True)
         self.metrics.update_packet_transmission(
-            is_critical=True, is_control=True, size_bytes=CONTROL_PACKET_BYTES_SMALL)
+            is_critical=True, is_control=True, size_bytes=self.control_packet_bytes,
+            size_bits=self.control_packet_bits)
         self._reset_inactivity_timer(current_time)
         return packet
 
@@ -113,6 +143,7 @@ class SensorNode:
             "payload": raw_data_value,
             "timestamp": current_time,
             "size_bytes": self.data_packet_bytes,
+            "size_bits": self.data_packet_bits,
             "energy_trace": [(self.node_id, reported_energy)]
         }
 
@@ -130,17 +161,30 @@ class SensorNode:
     def _transmit_packet(self, packet, is_critical):
         if self.status == "DEAD":
             return
-        if not is_critical:
-            if self.primary_next_hop is not None:
-                self._consume_energy(
-                    tx_bytes=packet["size_bytes"], distance=self._distance_to_next_hop(self.primary_next_hop))
-        else:
-            if self.primary_next_hop is not None:
-                self._consume_energy(
-                    tx_bytes=packet["size_bytes"], distance=self._distance_to_next_hop(self.primary_next_hop))
-            if self.secondary_next_hop is not None and self.secondary_next_hop != self.primary_next_hop:
-                self._consume_energy(tx_bytes=packet["size_bytes"], distance=self._distance_to_next_hop(
-                    self.secondary_next_hop))
+
+        is_data = str(packet.get("type", "DATA")).upper() == "DATA"
+        primary_hop = (
+            self.data_primary_next_hop
+            if is_data and self.data_primary_next_hop is not None
+            else self.primary_next_hop
+        )
+        secondary_hop = (
+            self.data_secondary_next_hop
+            if is_data and self.data_secondary_next_hop is not None
+            else self.secondary_next_hop
+        )
+
+        if primary_hop is not None:
+            self._consume_energy(
+                tx_bytes=packet["size_bytes"],
+                tx_bits=packet.get("size_bits"),
+                distance=self._distance_to_next_hop(primary_hop))
+        if (is_critical and secondary_hop is not None
+                and secondary_hop != primary_hop):
+            self._consume_energy(
+                tx_bytes=packet["size_bytes"],
+                tx_bits=packet.get("size_bits"),
+                distance=self._distance_to_next_hop(secondary_hop))
 
     def forward_packet(self, packet, current_time, distance_to_next):
         if self.status == "DEAD":
@@ -150,7 +194,8 @@ class SensorNode:
             packet["path_header"] = []
 
         packet["path_header"].append(self.node_id)
-        self._consume_energy(rx_bytes=packet["size_bytes"])
+        self._consume_energy(rx_bytes=packet["size_bytes"],
+                             rx_bits=packet.get("size_bits"))
 
         reported_energy = self.E_current
         if self.is_malicious:
@@ -161,15 +206,19 @@ class SensorNode:
         packet["energy_trace"].append((self.node_id, reported_energy))
 
         if self.is_malicious:
-            if random.random() < 0.50:
+            if self.rng.random() < 0.50:
                 return False
 
         self._consume_energy(
-            tx_bytes=packet["size_bytes"], distance=distance_to_next)
+            tx_bytes=packet["size_bytes"], tx_bits=packet.get("size_bits"),
+            distance=distance_to_next)
         self._reset_inactivity_timer(current_time)
         return True
 
     def check_inactivity(self, current_time):
+        # Fixed-charger energy is applied centrally by BaseStation so that the
+        # selected bottlenecks, injected energy, and infrastructure contribution
+        # are measurable.  Nodes do not self-assign chargers or create energy.
         if self.status == "DEAD":
             return None
 
@@ -178,7 +227,7 @@ class SensorNode:
         long_silence = silence_duration >= self.T_max_inactivity
 
         if self.is_malicious:
-            if random.random() < 0.05 and not self.sos_sent:
+            if self.rng.random() < 0.05 and not self.sos_sent:
                 temp_battery = self.E_current
                 self.E_current = 0.01
                 packet = self._send_sos_charge_request(current_time)
@@ -200,13 +249,15 @@ class SensorNode:
             'type': 'SOS_CHARGE',
             'priority': 'HIGH',
             'timestamp': current_time,
-            'size_bytes': CONTROL_PACKET_BYTES_SMALL,
+            'size_bytes': self.control_packet_bytes,
+            'size_bits': self.control_packet_bits,
             'energy_trace': [(self.node_id, self.E_current)]
         }
         self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=True)
         self.metrics.update_packet_transmission(
-            is_critical=True, is_control=True, size_bytes=CONTROL_PACKET_BYTES_SMALL)
+            is_critical=True, is_control=True, size_bytes=self.control_packet_bytes,
+            size_bits=self.control_packet_bits)
         self._reset_inactivity_timer(current_time)
         return packet
 
@@ -216,29 +267,36 @@ class SensorNode:
             'type': 'KEEP_ALIVE',
             'priority': 'NORMAL',
             'timestamp': current_time,
-            'size_bytes': CONTROL_PACKET_BYTES_SMALL,
+            'size_bytes': self.control_packet_bytes,
+            'size_bits': self.control_packet_bits,
             'energy_trace': [(self.node_id, self.E_current)]
         }
         self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=False)
         self.metrics.update_packet_transmission(
-            is_critical=False, is_control=True, size_bytes=CONTROL_PACKET_BYTES_SMALL)
+            is_critical=False, is_control=True, size_bytes=self.control_packet_bytes,
+            size_bits=self.control_packet_bits)
         self._reset_inactivity_timer(current_time)
         return packet
 
-    def _consume_energy(self, tx_bytes=0, rx_bytes=0, distance=0.0, aggregation=False):
-        bits = (tx_bytes + rx_bytes) * 8
+    def _consume_energy(self, tx_bytes=0, rx_bytes=0, distance=0.0, aggregation=False,
+                        tx_bits=None, rx_bits=None):
+        tx_bit_count = max(0.0, float(tx_bytes) *
+                           8.0 if tx_bits is None else float(tx_bits))
+        rx_bit_count = max(0.0, float(rx_bytes) *
+                           8.0 if rx_bits is None else float(rx_bits))
+        bits = tx_bit_count + rx_bit_count
         energy = 0.0
 
-        if rx_bytes > 0:
-            energy += rx_bytes * 8 * self.E_elec
+        if rx_bit_count > 0.0:
+            energy += rx_bit_count * self.E_elec
 
-        if tx_bytes > 0:
+        if tx_bit_count > 0.0:
             if distance <= self.d0:
-                energy += tx_bytes * 8 * \
+                energy += tx_bit_count * \
                     (self.E_elec + self.eps_fs * (distance ** 2))
             else:
-                energy += tx_bytes * 8 * \
+                energy += tx_bit_count * \
                     (self.E_elec + self.eps_mp * (distance ** 4))
 
         if aggregation:
@@ -246,6 +304,7 @@ class SensorNode:
 
         if self.status == "DEAD":
             return
+
         previous_energy = max(0.0, float(self.E_current))
         self.E_current = max(0.0, previous_energy - max(0.0, float(energy)))
         if self.E_current <= 0.0 and self.status == "ALIVE":
@@ -254,13 +313,22 @@ class SensorNode:
                 self.node_id, self.metrics.current_sim_time)
 
     def receive_wireless_charge(self, injected_energy):
-        if self.status == "DEAD":
+        injected_energy = max(0.0, float(injected_energy))
+        if injected_energy <= 0.0:
+            return 0.0
+        before = max(0.0, float(self.E_current))
+        self.E_current = min(float(self.E_max), before + injected_energy)
+        actual = max(0.0, float(self.E_current) - before)
+        if actual > 0.0 and self.status == "DEAD":
             self.status = "ALIVE"
-        self.E_current = min(
-            float(self.E_max),
-            max(0.0, float(self.E_current)) + max(0.0, float(injected_energy)),
-        )
+            if hasattr(self.metrics, 'record_node_revival'):
+                self.metrics.record_node_revival(
+                    self.node_id, self.metrics.current_sim_time)
         self.sos_sent = False
+        return actual
+
+    def receive_fixed_charge(self, injected_energy):
+        return self.receive_wireless_charge(injected_energy)
 
     def _reset_inactivity_timer(self, current_time):
         self.last_activity_time = current_time
@@ -269,3 +337,8 @@ class SensorNode:
         self.primary_next_hop = primary_hop
         self.secondary_next_hop = secondary_hop
         self.adaptive_threshold = new_threshold
+
+    def update_data_routes(self, primary_hop, secondary_hop):
+        """Update DATA-only next hops without touching control/charging state."""
+        self.data_primary_next_hop = primary_hop
+        self.data_secondary_next_hop = secondary_hop

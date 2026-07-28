@@ -1,12 +1,12 @@
 import os
 os.environ["OMP_NUM_THREADS"] = "1"
 
-import json
-import hmac
-import hashlib
-import numpy as np
-import pandas as pd
 import scipy.stats as stats
+import pandas as pd
+import numpy as np
+import hashlib
+import hmac
+import json
 
 
 DATA_PACKET_BITS = 4000
@@ -42,6 +42,7 @@ def compute_packet_hash(packet, key):
         "priority": packet.get("priority"),
         "payload": packet.get("payload"),
         "size_bytes": packet.get("size_bytes"),
+        "size_bits": packet.get("size_bits"),
         "source_energy": _source_energy(packet),
     }
     return hmac.new(str(key).encode("utf-8"), _canonical_json(safe_packet), hashlib.sha256).hexdigest()

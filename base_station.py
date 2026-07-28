@@ -10,7 +10,45 @@ from sklearn.metrics import silhouette_score
 
 from config import compute_packet_hash, make_mc_mac, _source_energy, DATA_PACKET_BITS
 from routing import BaselineRouting
-from adaptive_charging import QuantumFuzzyChargingOracle
+from adaptive_charging import QuantumFuzzyChargingOracle, DynamicChargingDurationOracle
+
+
+class ChargingCluster:
+    """Spatial RF charging stop containing one or more sensor nodes."""
+
+    def __init__(self, cluster_id, nodes, cx, cy, radius=0.0):
+        self.is_cluster = True
+        self.cluster_id = cluster_id
+        self.nodes = list(nodes)
+        self.centroid_x = float(cx)
+        self.centroid_y = float(cy)
+        self.radius = max(0.0, float(radius))
+        member_ids = tuple(sorted(int(node.node_id) for node in self.nodes))
+        self.member_ids = member_ids
+        self.node_id = "Cluster_" + "_".join(map(str, member_ids))
+
+    def recompute_geometry(self):
+        if not self.nodes:
+            self.centroid_x = 0.0
+            self.centroid_y = 0.0
+            self.radius = 0.0
+            self.member_ids = tuple()
+            self.node_id = f"Cluster_empty_{self.cluster_id}"
+            return self
+        self.centroid_x = float(np.mean([node.x for node in self.nodes]))
+        self.centroid_y = float(np.mean([node.y for node in self.nodes]))
+        self.radius = max(math.hypot(
+            node.x - self.centroid_x, node.y - self.centroid_y)
+            for node in self.nodes)
+        self.member_ids = tuple(sorted(int(node.node_id)
+                                for node in self.nodes))
+        self.node_id = "Cluster_" + "_".join(map(str, self.member_ids))
+        return self
+
+    @classmethod
+    def from_nodes(cls, cluster_id, nodes):
+        cluster = cls(cluster_id, list(nodes), 0.0, 0.0, 0.0)
+        return cluster.recompute_geometry()
 
 
 class BaseStation:
@@ -26,11 +64,25 @@ class BaseStation:
         self.network_nodes = {}
         self.node_states = {}
         self.routing_tables = {}
+        # Enhanced DATA-plane routes are deliberately separate from the
+        # original control/charging-plane tables.  Charging logic continues to
+        # read self.routing_tables exactly as before.
+        self.data_routing_tables = {}
+        self.data_standby_routing_tables = None
+        self.data_routing_engine = None
+        self._last_data_route_signature = None
+
+        # [INNOVATION] Initialize cluster_heads mapping
+        self.cluster_heads = {}
 
         self.packet_logs = []
         self.dropped_packets_tracker = defaultdict(list)
         self.pending_sos_requests = set()
+
         self.secure_charging_queue = []
+        self.secure_charging_node_ids = set()
+        self.service_charging_node_ids = set()
+        self.plus_charging_node_ids = set()
 
         self.experiment_family = self.ablation.get(
             'experiment_family', 'communication_security')
@@ -43,14 +95,13 @@ class BaseStation:
         self.FCM_GREYLIST_THRESHOLD = 0.2
         self.T_epoch = 10.0
 
-        self.eta_charging = 0.70
+        self.eta_charging = float(self.ablation.get(
+            'charging_energy_efficiency',
+            self.ablation.get('rf_energy_conversion_efficiency', 0.70)))
         self.mc_recent_injected_energy = defaultdict(float)
         self.mc_real_injected_energy = defaultdict(float)
         self.quarantined_zones = []
         self.mc_reference = None
-        # Backward-compatible single-MC reference plus optional multi-MC fleet.
-        # The simulator keeps mc_reference pointing at the primary charger when
-        # only one charger is configured, so legacy experiments are unchanged.
         self.mc_references = []
         self.mc_shared_key = None
         self.mc_shared_keys = {}
@@ -76,7 +127,6 @@ class BaseStation:
         self.RISK_HYSTERESIS_EPOCHS = 3
         self.RISK_WARMUP_EPOCHS = 3
 
-        # Extracted Magic Numbers for Risk Weighting
         self.RISK_WEIGHTS = {
             'fcm': 0.45, 'auth': 0.90, 'drop': 0.80, 'delay': 0.35,
             'traffic': 0.35, 'energy': 0.55, 'stealth': 0.95, 'sed': 0.80,
@@ -116,10 +166,24 @@ class BaseStation:
             lambda: defaultdict(lambda: defaultdict(set)))
         self.last_seq_per_source_by_type = defaultdict(dict)
 
-        # Adaptive mobile-charging controls are inert outside energy experiments,
-        # so communication-security results remain governed by the original logic.
         self.use_adaptive_quantum_charging = bool(
             self.ablation.get('use_adaptive_quantum_charging', False))
+
+        self.use_hybrid_fixed_chargers = bool(
+            self.ablation.get('use_hybrid_fixed_chargers', False))
+        self.fixed_charger_nodes = set()
+
+        self.use_rf_multi_node_charging = bool(
+            self.ablation.get('use_rf_multi_node_charging', False))
+        self.rf_charging_radius = float(
+            self.ablation.get('rf_charging_radius', 25.0))
+
+        self.dynamic_charging_oracle = DynamicChargingDurationOracle(
+            w_wt=float(self.ablation.get('dynamic_charging_weight_wt', 1.0)),
+            w_eps=float(self.ablation.get('dynamic_charging_weight_eps', 1.0)),
+            w_now=float(self.ablation.get('dynamic_charging_weight_now', 1.0)))
+        self._last_fixed_charge_time = None
+
         self.min_charge_energy_ratio = float(
             self.ablation.get('minimum_charge_energy_ratio', 0.08))
         self.post_charge_release_ratio = float(
@@ -157,6 +221,108 @@ class BaseStation:
         else:
             self.routing_engine = routing_engine
 
+    def _update_fixed_charger_assignments(self):
+        for nid, node in self.network_nodes.items():
+            if nid != self.BS_ID:
+                node.has_fixed_charger = False
+                if nid in self.node_states:
+                    self.node_states[nid]['has_fixed_charger'] = False
+
+        self.fixed_charger_nodes.clear()
+        if not self.use_hybrid_fixed_chargers or not self.node_states:
+            self.metrics.fixed_charger_active_nodes = 0
+            return
+
+        relay_load = defaultdict(int)
+        for route in self.routing_tables.values():
+            path = route.get('primary_path') or []
+            for relay_id in path[1:-1]:
+                relay_load[relay_id] += 1
+
+        candidates = [
+            nid for nid, state in self.node_states.items()
+            if nid != self.BS_ID
+            and nid in self.network_nodes
+            and state.get('status', 'WHITELISTED') not in ('BLACKLISTED', 'QUARANTINE')
+        ]
+        if not candidates:
+            self.metrics.fixed_charger_active_nodes = 0
+            return
+
+        eps_values = [self._effective_depletion_rate(
+            nid) for nid in candidates]
+        relay_values = [float(relay_load.get(nid, 0)) for nid in candidates]
+        eps_max = max(eps_values, default=0.0)
+        relay_max = max(relay_values, default=0.0)
+
+        def bottleneck_score(nid):
+            eps = self._effective_depletion_rate(nid)
+            eps_norm = eps / eps_max if eps_max > 0.0 else 0.0
+            relay_norm = relay_load.get(
+                nid, 0) / relay_max if relay_max > 0.0 else 0.0
+            return (0.5 * eps_norm + 0.5 * relay_norm, relay_norm, eps_norm)
+
+        requested_count = int(self.ablation.get(
+            'fixed_charger_count', self.ablation.get('num_mobile_chargers', 1)))
+        selected = sorted(candidates, key=bottleneck_score, reverse=True)[
+            :max(0, requested_count)]
+        self.fixed_charger_nodes.update(selected)
+        for nid in selected:
+            self.network_nodes[nid].has_fixed_charger = True
+            self.node_states[nid]['has_fixed_charger'] = True
+            self.node_states[nid]['fixed_charger_bottleneck_score'] = float(
+                bottleneck_score(nid)[0])
+        self.metrics.fixed_charger_active_nodes = len(selected)
+
+    def apply_fixed_charging(self, current_time):
+        now = float(current_time)
+        if self._last_fixed_charge_time is None:
+            self._last_fixed_charge_time = now
+            return 0.0
+        delta_t = max(0.0, now - self._last_fixed_charge_time)
+        self._last_fixed_charge_time = now
+        if not self.use_hybrid_fixed_chargers or delta_t <= 0.0:
+            return 0.0
+
+        trigger_ratio = float(self.ablation.get(
+            'fixed_charger_trigger_ratio', self.ablation.get(
+                'critical_energy_ratio', 0.15)))
+        target_ratio = float(self.ablation.get(
+            'fixed_charger_target_ratio', self.post_charge_release_ratio))
+        charging_power = float(self.ablation.get('charging_rate', 5.0))
+        total_injected = 0.0
+
+        for nid in sorted(self.fixed_charger_nodes):
+            node = self.network_nodes.get(nid)
+            state = self.node_states.get(nid)
+            if node is None or state is None:
+                continue
+            e_max = max(float(node.E_max), 1e-12)
+            if float(node.E_current) / e_max > trigger_ratio:
+                continue
+            desired = max(0.0, target_ratio * e_max - float(node.E_current))
+            injected = min(desired, max(0.0, charging_power * delta_t))
+            if injected <= 0.0:
+                continue
+            actual = float(node.receive_fixed_charge(injected))
+            if actual <= 0.0:
+                continue
+            total_injected += actual
+            self.metrics.record_fixed_charge(nid, actual)
+            state['E_est'] = min(e_max, float(
+                state.get('E_est', 0.0)) + actual)
+            state['total_injected_energy'] = float(
+                state.get('total_injected_energy', 0.0)) + actual
+            state['energy_injected_since_physical_sample'] = float(
+                state.get('energy_injected_since_physical_sample', 0.0)) + actual
+            state['E_claimed'] = max(
+                float(state.get('E_claimed', 0.0)), state['E_est'])
+            state['energy_last_reported'] = state['E_est']
+            state['energy_last_report_time'] = now
+            state['charge_satisfied'] = state['E_est'] / e_max >= target_ratio
+            self.pending_sos_requests.discard(nid)
+        return total_injected
+
     def record_environmental_observation(self, node_id, value):
         if value is not None:
             self.environmental_history[node_id].append(float(value))
@@ -168,7 +334,9 @@ class BaseStation:
         return path
 
     def _approved_critical_paths(self, source_id):
-        routes = self.routing_tables.get(source_id, {}) or {}
+        routes = (self.data_routing_tables.get(source_id, {})
+                  if self.data_routing_tables else
+                  self.routing_tables.get(source_id, {})) or {}
         candidates = []
         for key in ('critical_paths', 'primary_path', 'secondary_path'):
             val = routes.get(key)
@@ -332,6 +500,98 @@ class BaseStation:
         if interrupt_triggered and self.ablation.get('use_asynchronous_processing_pipeline', True):
             self.control_plane_epoch()
 
+    def _now(self):
+        return float(getattr(self.metrics, 'current_sim_time', 0.0))
+
+    def _node_energy_or_topology_impaired(self, node_id):
+        if node_id == self.BS_ID:
+            return False
+        node = self.network_nodes.get(node_id)
+        if node is None:
+            return True
+        if getattr(node, 'status', 'ALIVE') != 'ALIVE':
+            return True
+        critical = float(getattr(node, 'E_critical', 0.0))
+        return float(getattr(node, 'E_current', 0.0)) <= critical
+
+    def _path_has_energy_or_topology_failure(self, path):
+        path = list(path or [])
+        if len(path) < 2:
+            return True
+        tx_range = float(getattr(self.routing_engine, 'transmission_range',
+                                 self.ablation.get('transmission_range', 40.0)))
+        for nid in path[:-1]:
+            if self._node_energy_or_topology_impaired(nid):
+                return True
+        for a, b in zip(path[:-1], path[1:]):
+            na = self.network_nodes.get(a)
+            nb = self.network_nodes.get(b)
+            if na is None or nb is None:
+                return True
+            if math.hypot(float(na.x) - float(nb.x),
+                          float(na.y) - float(nb.y)) > tx_range + 1e-9:
+                return True
+        return False
+
+    def _update_physical_depletion_estimates(self):
+        now = self._now()
+        beta = float(np.clip(self.ablation.get(
+            'physical_eps_ewma_beta', 0.70), 0.0, 0.9999))
+        for nid, state in self.node_states.items():
+            if nid == self.BS_ID:
+                continue
+            node = self.network_nodes.get(nid)
+            if node is None:
+                continue
+            current = max(0.0, float(getattr(node, 'E_current', 0.0)))
+            last_t = state.get('physical_energy_sample_time')
+            last_e = state.get('physical_energy_sample')
+            injected = max(0.0, float(
+                state.get('energy_injected_since_physical_sample', 0.0)))
+            if last_t is not None and last_e is not None:
+                dt = max(1e-9, now - float(last_t))
+                consumed = max(0.0, float(last_e) + injected - current)
+                q_inst = consumed / dt
+                previous = float(state.get('physical_eps_ewma', q_inst))
+                state['physical_eps_ewma'] = (
+                    beta * previous + (1.0 - beta) * q_inst)
+                state['physical_eps_last'] = float(q_inst)
+            else:
+                state.setdefault('physical_eps_ewma', 0.0)
+            state['physical_energy_sample'] = current
+            state['physical_energy_sample_time'] = now
+            state['energy_injected_since_physical_sample'] = 0.0
+
+    def _effective_depletion_rate(self, node_id, current_time=None):
+        state = self.node_states.get(node_id, {})
+        node = self.network_nodes.get(node_id)
+        now = self._now() if current_time is None else float(current_time)
+        idle = max(0.0, float(self.ablation.get(
+            'idle_sensing_power_j_per_s', 0.0)))
+        q_report = max(0.0, float(state.get('energy_q_ewma', 0.0)))
+        q_physical = max(0.0, float(state.get('physical_eps_ewma', 0.0)))
+        elapsed = max(now, float(self.T_epoch), 1.0)
+        q_cumulative = max(0.0, float(state.get(
+            'E_consumption_est_cumulative', 0.0))) / elapsed
+
+        base = max(idle, q_report, q_physical, q_cumulative)
+        hop_pressure = min(1.0, max(0.0, float(
+            state.get('hop_count_to_bs_norm', 0.0))))
+        disagreement = abs(q_physical - q_report) / max(base, 1e-12)
+        uncertainty = min(0.35, 0.10 * disagreement)
+        factor = max(1.0, float(self.ablation.get(
+            'depletion_rate_safety_factor', 1.20)))
+        factor *= 1.0 + 0.15 * hop_pressure + uncertainty
+        effective = base * factor
+
+        e_max = max(float(getattr(node, 'E_max', state.get(
+            'E_initial', 1.0))), 1e-12)
+        upper = e_max / max(float(self.ablation.get(
+            'minimum_depletion_lifetime_s', 30.0)), 1.0)
+        effective = float(np.clip(effective, idle, upper))
+        state['effective_depletion_rate'] = effective
+        return effective
+
     def _calculate_hybrid_weights(self, valid_nodes):
         if not self.ablation.get('use_shannon_entropy_weights', True):
             return np.array([0.25, 0.25, 0.15, 0.15, 0.20])
@@ -366,6 +626,11 @@ class BaseStation:
         valid_nodes = [n for n in nodes if n != self.BS_ID]
         dynamic_weights = self._calculate_hybrid_weights(valid_nodes)
         self.current_dynamic_weights = dynamic_weights
+        try:
+            self.metrics.dynamic_trust_weights_history.append(
+                np.asarray(dynamic_weights, dtype=float).copy())
+        except Exception:
+            pass
 
         for nid in valid_nodes:
             if self.node_states[nid].get('status') == 'BLACKLISTED':
@@ -389,6 +654,8 @@ class BaseStation:
             start_time = time.time()
             self.control_epoch_index += 1
 
+            self._update_physical_depletion_estimates()
+            self._update_fixed_charger_assignments()
             self._verify_wrsn_cyber_physical_security()
             self._two_tier_trust_matrix()
             self._verify_stealthy_attackers()
@@ -399,9 +666,8 @@ class BaseStation:
             U_malicious_dict = self._fcm_classification()
             self._calibrated_risk_fusion(U_malicious_dict)
 
-            network_clusters = self._network_clustering()
-            self._joint_optimization(
-                U_malicious_dict, network_clusters)
+            # [INNOVATION] Network clustering mapping for routing and chargers
+            self._joint_optimization(U_malicious_dict)
 
             self.packet_logs.clear()
             self.dropped_packets_tracker.clear()
@@ -514,12 +780,14 @@ class BaseStation:
         if not nodes:
             return
 
-        E_elec = 50e-9
-        eps_fs = 10e-12
-        eps_mp = 0.0013e-12
+        E_elec = float(self.ablation.get('radio_e_elec_j_per_bit', 50e-9))
+        eps_fs = float(self.ablation.get('radio_eps_fs_j_per_bit_m2', 10e-12))
+        eps_mp = max(float(self.ablation.get(
+            'radio_eps_mp_j_per_bit_m4', 0.0013e-12)), 1e-30)
         d0 = math.sqrt(eps_fs / eps_mp)
-        packet_bits = DATA_PACKET_BITS
-        ack_bits = 16 * 8
+        packet_bits = float(self.ablation.get(
+            'data_packet_bits', DATA_PACKET_BITS))
+        ack_bits = float(self.ablation.get('ack_packet_bits', 16 * 8))
 
         tx_energy_consumed = defaultdict(float)
         rx_energy_consumed = defaultdict(float)
@@ -552,18 +820,29 @@ class BaseStation:
                                       n_sender.y - n_receiver.y)
                     tx_energy_consumed[sender] += _tx_energy(packet_bits, dist)
 
+        security_packet_logs = [
+            log for log in self.packet_logs
+            if not self._path_has_energy_or_topology_failure(log.get('path', []))
+        ]
+
         path_success_counts = defaultdict(int)
         path_tamper_counts = defaultdict(int)
 
-        for log in self.packet_logs:
+        for log in security_packet_logs:
             path_tuple = tuple(log['path'])
             if log['hash_valid']:
                 path_success_counts[path_tuple] += 1
-            else:
-                path_tamper_counts[path_tuple] += 1
 
-        path_drop_counts = {tuple(path): len(
-            drops) for path, drops in self.dropped_packets_tracker.items() if len(drops) > 0}
+        for log in self.packet_logs:
+            if not log.get('hash_valid', True):
+                path_tamper_counts[tuple(log.get('path', []))] += 1
+
+        path_drop_counts = {
+            tuple(path): len(drops)
+            for path, drops in self.dropped_packets_tracker.items()
+            if len(drops) > 0
+            and not self._path_has_energy_or_topology_failure(path)
+        }
         node_drop_participation = defaultdict(int)
         for p, d_count in path_drop_counts.items():
             for nid in p[1:-1]:
@@ -688,7 +967,9 @@ class BaseStation:
                 else:
                     t1_new = t1_prev
 
-            if N_recv[nid] > 0:
+            if self._node_energy_or_topology_impaired(nid):
+                t2_new = t2_prev
+            elif N_recv[nid] > 0:
                 pdr = N_fwd[nid] / N_recv[nid]
                 t2_new = beta * t2_prev + (1.0 - beta) * pdr
             else:
@@ -699,14 +980,15 @@ class BaseStation:
             state['trust_vector'][0] = t1_new
             state['trust_vector'][1] = t2_new
 
-        P = len(self.packet_logs)
+        delay_logs = security_packet_logs
+        P = len(delay_logs)
         N = len(nodes)
 
         if P > 0 and N > 0:
             node_to_idx = {nid: idx for idx, nid in enumerate(nodes)}
             A = np.zeros((P, N))
             Y = np.zeros(P)
-            for p_idx, log in enumerate(self.packet_logs):
+            for p_idx, log in enumerate(delay_logs):
                 path = log['path']
                 Y[p_idx] = log['delay']
                 for nid in path[1:-1]:
@@ -723,12 +1005,14 @@ class BaseStation:
             d_prop = 0.01
             d_proc = 0.05
             queue_load = defaultdict(int)
-            for log in self.packet_logs:
+            for log in delay_logs:
                 for nid in log['path'][1:-1]:
                     queue_load[nid] += 1
 
             for nid in nodes:
                 if nid == self.BS_ID:
+                    continue
+                if self._node_energy_or_topology_impaired(nid):
                     continue
                 idx = node_to_idx[nid]
                 d_avg_i = X_d_avg[idx]
@@ -756,7 +1040,7 @@ class BaseStation:
 
         U_actual = defaultdict(int)
         U_expected = defaultdict(float)
-        for log in self.packet_logs:
+        for log in security_packet_logs:
             path = log['path']
             for nid in path:
                 if nid != self.BS_ID:
@@ -792,7 +1076,7 @@ class BaseStation:
             delta_seq = max(0, curr_seq - prev_seq)
             state['prev_epoch_seq'] = curr_seq
 
-            crit_seq_set = {log['seq'] for log in self.packet_logs if log['source'] == nid and log.get(
+            crit_seq_set = {log['seq'] for log in security_packet_logs if log['source'] == nid and log.get(
                 'priority') == 'HIGH'}
             crit_count = len(crit_seq_set)
             normal_gen_count = max(0, delta_seq - crit_count)
@@ -827,6 +1111,8 @@ class BaseStation:
         for nid in nodes:
             if nid == self.BS_ID:
                 continue
+            if self._node_energy_or_topology_impaired(nid):
+                continue
             u_act = U_actual.get(nid, 0)
             u_exp = U_expected.get(nid, 0.0)
             deviation = abs(u_act - u_exp) / max(u_exp, epsilon)
@@ -857,16 +1143,14 @@ class BaseStation:
             state['idle_sensing_energy_epoch'] = 0.0
 
             total_injected = state.get('total_injected_energy', 0.0)
-            E_est = E_max - cumulative_consumption + \
-                (self.eta_charging * total_injected)
+            E_est = E_max - cumulative_consumption + total_injected
             E_est = max(0.0, min(E_max, E_est))
             state['E_est'] = E_est
 
-            ratio_est = E_est / max(E_max, 1e-12)
             deviation = abs(E_claimed - E_est) / max(E_max, 1e-12)
             penalty_factor = math.exp(-nu_t5 * deviation)
             spoof_trust = state.get('spoof_trust', 1.0)
-            t5_current = ratio_est * penalty_factor * spoof_trust
+            t5_current = penalty_factor * spoof_trust
 
             t5_prev = state.get('T5_history', 1.0)
             t5_new = rho_t5 * t5_prev + (1.0 - rho_t5) * t5_current
@@ -942,7 +1226,10 @@ class BaseStation:
             return {nid: 0.0 for nid in self.node_states.keys()}
 
         attribution = {nid: 0.0 for nid in self.node_states.keys()}
-        records = list(self.path_history)
+        records = [
+            r for r in self.path_history
+            if not self._path_has_energy_or_topology_failure(r.get('path', ()))
+        ]
         if len(records) < 5:
             return attribution
 
@@ -960,6 +1247,18 @@ class BaseStation:
                 'success', True)) / len(excludes)
             attribution[nid] = max(0.0, fail_contains - fail_excludes)
         return attribution
+
+    def _has_explicit_security_evidence(self, node_id, state=None):
+        state = self.node_states.get(node_id, {}) if state is None else state
+        return bool(
+            state.get('hard_veto', False)
+            or int(state.get('packet_auth_failures', 0)) > 0
+            or int(state.get('sequence_replay_count', 0)) > 0
+            or bool(state.get('confirmed_sed_attack', False))
+            or bool(state.get('confirmed_stealth_attack', False))
+            or float(state.get('Deviation_MC_norm', 0.0)) > self.CHARGE_MAX_DEVIATION_MC_NORM
+            or float(state.get('spoof_trust', 1.0)) < self.CHARGE_MIN_SPOOF_TRUST
+        )
 
     def _calibrated_risk_fusion(self, U_malicious_dict):
         if not self.ablation.get('use_uncertainty_calibrated_risk', True):
@@ -1012,6 +1311,16 @@ class BaseStation:
                 'counterfactual': min(1.0, max(0.0, float(cf_attr.get(nid, 0.0))))
             }
 
+            impaired = self._node_energy_or_topology_impaired(nid)
+            explicit_evidence = self._has_explicit_security_evidence(
+                nid, state)
+            if impaired:
+                for key in ('drop', 'delay', 'traffic', 'counterfactual', 'energy'):
+                    risks[key] = 0.0
+                explicit_risk = max(
+                    risks['auth'], risks['stealth'], risks['sed'], risks['mc'])
+                risks['fcm'] = min(risks['fcm'], explicit_risk)
+
             survival = 1.0
             for key, risk_value in risks.items():
                 survival *= (1.0 -
@@ -1035,7 +1344,15 @@ class BaseStation:
             state['risk_lcb'] = risk_lcb
             state['risk_uncertainty'] = uncertainty
 
-            if (self.control_epoch_index > self.RISK_WARMUP_EPOCHS and risk_lcb >= self.RISK_BLACKLIST_LCB):
+            if self.energy_experiment_active and impaired and not explicit_evidence:
+                state['blacklist_counter'] = 0
+                state['status'] = (
+                    'WATCHLIST' if risk_mean >= self.RISK_WATCHLIST
+                    else 'WHITELISTED')
+                continue
+
+            if (self.control_epoch_index > self.RISK_WARMUP_EPOCHS and
+                    risk_lcb >= self.RISK_BLACKLIST_LCB):
                 state['blacklist_counter'] = state.get(
                     'blacklist_counter', 0) + 1
             else:
@@ -1053,521 +1370,51 @@ class BaseStation:
                 state['status'] = 'WHITELISTED'
 
     def _network_clustering(self):
-        valid_nodes = [nid for nid, state in self.node_states.items(
-        ) if state['status'] != 'BLACKLISTED']
-        if not valid_nodes:
-            return {}
-
-        X_coords = np.array(
-            [[self.node_states[nid]['x'], self.node_states[nid]['y']] for nid in valid_nodes])
-        K = max(1, int(math.sqrt(len(valid_nodes) / 2)))
-        kmeans = KMeans(n_clusters=K, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(X_coords)
-
+        """
+        [INNOVATION] K-Means removed! Clustering is now handled natively by the 
+        Hybrid Routing Engine (IFBE+FCBE) inside routing.py.
+        This method now extracts the active Cluster Heads and Clusters directly 
+        from the computed routing tables to feed the Mobile Charger urgency logic.
+        """
         clusters = defaultdict(list)
-        for idx, nid in enumerate(valid_nodes):
-            clusters[labels[idx]].append(nid)
-
         self.cluster_heads = {}
-        bs_node = self.network_nodes.get(self.BS_ID)
 
-        for cluster_id, members in clusters.items():
-            head_candidates = [
-                m for m in members
-                if self.node_states[m].get('status') not in ('BLACKLISTED', 'QUARANTINE')
-            ] or members
+        if not self.routing_tables:
+            return clusters
 
-            def _cluster_head_score(member_id):
-                state = self.node_states[member_id]
-                node = self.network_nodes[member_id]
-                fe_score = float(state.get('FE', 0.0))
-                residual_ratio = float(state.get('E_est', state.get(
-                    'E_initial', 1.0))) / max(float(state.get('E_initial', 1.0)), 1e-12)
+        for nid, table in self.routing_tables.items():
+            if nid == self.BS_ID:
+                continue
 
-                local_degree = 0
-                for other_id in members:
-                    if other_id == member_id:
-                        continue
-                    other = self.network_nodes[other_id]
-                    if math.hypot(node.x - other.x, node.y - other.y) <= 30.0:
-                        local_degree += 1
-                connectivity_score = local_degree / max(len(members) - 1, 1)
+            primary_hop = table.get('primary')
+            if primary_hop is not None and primary_hop != self.BS_ID:
+                clusters[primary_hop].append(nid)
+                self.cluster_heads[primary_hop] = primary_hop
 
-                if bs_node is not None:
-                    d_bs = math.hypot(node.x - bs_node.x, node.y - bs_node.y)
-                    topology_score = 0.5 * connectivity_score + \
-                        0.5 * (1.0 / (1.0 + d_bs))
-                else:
-                    topology_score = connectivity_score
+        for ch in self.cluster_heads:
+            if ch not in clusters[ch]:
+                clusters[ch].append(ch)
 
-                return (0.60 * fe_score) + (0.25 * residual_ratio) + (0.15 * topology_score)
-
-            self.cluster_heads[cluster_id] = max(
-                head_candidates, key=_cluster_head_score)
+        try:
+            k_opt_val = len(self.cluster_heads)
+            if hasattr(self.metrics, 'adaptive_k_opts'):
+                self.metrics.adaptive_k_opts.append(k_opt_val)
+            else:
+                self.metrics.adaptive_k_opts = [k_opt_val]
+        except Exception:
+            pass
 
         return clusters
 
-    def _verify_wrsn_cyber_physical_security(self):
-        if not self.ablation.get('use_zero_overhead_spoof_detection', True):
-            for nid in list(self.mc_recent_injected_energy.keys()):
-                self.mc_recent_injected_energy[nid] = 0.0
-            return
+    def _joint_optimization(self, U_malicious_dict):
+        """Update reference and enhanced DATA routes on separate planes.
 
-        for nid, state in self.node_states.items():
-            if nid == self.BS_ID or state['status'] == 'BLACKLISTED':
-                continue
-
-            E_max = state['E_initial']
-            E_claimed_t = state.get('E_claimed', E_max)
-            E_claimed_t_minus_1 = state.get('E_claimed_prev', E_max)
-            E_injected = self.mc_recent_injected_energy.get(nid, 0.0)
-
-            delta_claimed = E_claimed_t - E_claimed_t_minus_1
-            deviation_mc = abs(
-                delta_claimed - (self.eta_charging * E_injected))
-
-            tolerance = 0.05 * E_max
-            state['Deviation_MC'] = deviation_mc
-            state['Deviation_MC_norm'] = min(
-                1.0, deviation_mc / max(tolerance, 1e-12))
-
-            if deviation_mc > (2.0 * tolerance):
-                legitimate_credit = bool(
-                    state.get('legitimate_mc_credit_pending', False))
-                if E_injected > 0 and delta_claimed <= tolerance and not legitimate_credit:
-                    self.metrics.charge_hoarder_attempts += 1
-                    self.metrics.charge_hoarder_detections += 1
-                    print(
-                        f"[WRSN SECURITY] Charge Hoarding detected at Node {nid}! Hard veto triggered.")
-                    state['hard_veto'] = True
-                    state['status'] = 'BLACKLISTED'
-                    state['FE'] = 0.0
-                elif E_injected == 0 and delta_claimed > tolerance:
-                    self.metrics.fake_charger_attempts += 1
-                    self.metrics.fake_charger_detections += 1
-                    print(
-                        f"[WRSN SECURITY] Vampire Attack detected at Node {nid}! Hard veto triggered.")
-                    state['hard_veto'] = True
-                    state['status'] = 'BLACKLISTED'
-                    state['FE'] = 0.0
-
-            t2_current = state.get('T2_history', 1.0)
-            already_rescued = state.get('spoof_rescue_triggered', False)
-
-            if t2_current > 0.8:
-                state['spoof_rescue_triggered'] = False
-
-            if t2_current < 0.5 and delta_claimed <= 0 and E_injected == 0 and not already_rescued:
-                print(
-                    f"[WRSN SECURITY] Spoofing Attack detected affecting Node {nid}! Triggering Incident Response.")
-                self.trigger_incident_response(
-                    victim_id=nid, spoof_x=state['x'], spoof_y=state['y'])
-                state['spoof_rescue_triggered'] = True
-
-            state['E_claimed_prev'] = E_claimed_t
-            state['legitimate_mc_credit_pending'] = False
-            self.mc_recent_injected_energy[nid] = 0.0
-
-    def _now(self):
-        return float(getattr(self.metrics, 'current_sim_time', 0.0))
-
-    def _observe_energy_report(self, node_id, reported_energy, receive_time):
-        """Update EWMA consumption from piggybacked energy without node-side computation."""
-        state = self.node_states.get(node_id)
-        if state is None:
-            return
-        now = float(receive_time)
-        reported_energy = float(max(0.0, reported_energy))
-        last_t = state.get('energy_last_report_time')
-        last_e = state.get('energy_last_reported')
-        if last_t is not None and last_e is not None:
-            dt = max(1e-9, now - float(last_t))
-            q_inst = max(0.0, (float(last_e) - reported_energy) / dt)
-            beta = float(self.ablation.get('energy_ewma_beta',
-                         self.ablation.get('ewma_beta', 0.70)))
-            q_prev = float(state.get('energy_q_ewma', q_inst))
-            state['energy_q_ewma'] = beta * q_inst + (1.0 - beta) * q_prev
-            pred_before_report = state.get('E_est', reported_energy)
-            try:
-                self.metrics.ewma_energy_abs_errors.append(
-                    abs(float(pred_before_report) - reported_energy))
-            except Exception:
-                pass
-        else:
-            state.setdefault('energy_q_ewma', 0.0)
-        state['energy_last_report_time'] = now
-        state['energy_last_reported'] = reported_energy
-        # The report is authenticated before reaching this point, so it can be used
-        # as the latest central estimate unless later security filters reject it.
-        state['E_est'] = max(
-            0.0, min(float(state.get('E_initial', reported_energy)), reported_energy))
-
-    def _estimate_energy_now(self, node_id, current_time=None):
-        state = self.node_states.get(node_id)
-        if state is None:
-            return 0.0
-        E0 = float(state.get('E_initial', 1.0))
-        now = self._now() if current_time is None else float(current_time)
-        last_e = float(
-            state.get('energy_last_reported', state.get('E_est', E0)))
-        last_t = float(state.get('energy_last_report_time', now))
-        q = float(state.get('energy_q_ewma', 0.0))
-        predicted = max(0.0, min(E0, last_e - q * max(0.0, now - last_t)))
-        # Accepted MC reports are credited immediately to avoid repeated dispatches
-        # caused by delayed piggyback feedback.
-        service_est = float(state.get('E_est', predicted))
-        predicted = max(predicted, min(E0, service_est))
-        state['E_est'] = predicted
-        return predicted
-
-    def _node_center_distance_norm(self, state):
-        if self.BS_ID in self.network_nodes:
-            bx = float(self.network_nodes[self.BS_ID].x)
-            by = float(self.network_nodes[self.BS_ID].y)
-        else:
-            xs = [float(st.get('x', 0.0)) for st in self.node_states.values()]
-            ys = [float(st.get('y', 0.0)) for st in self.node_states.values()]
-            bx = float(np.mean(xs)) if xs else 0.0
-            by = float(np.mean(ys)) if ys else 0.0
-        return min(1.0, math.hypot(float(state.get('x', bx)) - bx, float(state.get('y', by)) - by) /
-                   max(float(self.ablation.get('network_diagonal', 141.421356)), 1e-6))
-
-    def _ideal_charge_threshold(self, node_id, e_ratio, ed_norm, sd_norm):
-        state = self.node_states.get(node_id, {})
-        q = float(state.get('energy_q_ewma', 0.0))
-        E0 = float(state.get('E_initial', 1.0))
-        ttd = (e_ratio * E0) / max(q, 1e-12) if q > 0 else 1e6
-        risk = float(state.get('risk_mean', state.get('fcm_risk', 0.0)))
-        path_len = len((self.routing_tables.get(node_id, {})
-                       or {}).get('primary_path', []) or [])
-        route_pressure = min(1.0, max(0, path_len - 2) / 8.0)
-        time_pressure = 1.0 - \
-            min(1.0, ttd / float(self.ablation.get('qifl_safe_horizon_s', 1800.0)))
-        target = 0.20 + 0.16 * time_pressure + 0.07 * \
-            sd_norm + 0.05 * risk + 0.04 * route_pressure
-        return float(np.clip(target, self.qifl_threshold_lower_bound, self.qifl_threshold_upper_bound))
-
-    def get_adaptive_charge_threshold_for_node(self, node_id):
-        state = self.node_states.get(node_id)
-        if state is None:
-            return float(self.ablation.get('charge_need_ratio', self.CHARGE_NEED_RATIO))
-        E0 = float(state.get('E_initial', 1.0))
-        E_est = self._estimate_energy_now(node_id)
-        q = float(state.get('energy_q_ewma', 0.0))
-        # ED is survival-time adequacy: lower values mean more urgent charging.
-        survival_time = E_est / \
-            max(q, 1e-12) if q > 0 else float(self.ablation.get('qifl_safe_horizon_s', 1800.0))
-        ed_norm = min(1.0, survival_time /
-                      max(float(self.ablation.get('qifl_safe_horizon_s', 1800.0)), 1e-6))
-        centrality = min(1.0, float(state.get('hop_count_to_bs_norm', 0.0)))
-        sd_norm = min(
-            1.0, 0.65 * self._node_center_distance_norm(state) + 0.35 * centrality)
-        if self.use_adaptive_quantum_charging:
-            threshold, _ = self.qifl_oracle.infer(ed_norm, sd_norm)
-            ideal = self._ideal_charge_threshold(
-                node_id, E_est / max(E0, 1e-12), ed_norm, sd_norm)
-            loss = self.qifl_oracle.train_step(ed_norm, sd_norm, ideal)
-            try:
-                self.metrics.qifl_training_losses.append(float(loss))
-            except Exception:
-                pass
-        else:
-            threshold = float(self.ablation.get(
-                'charge_need_ratio', self.CHARGE_NEED_RATIO))
-        threshold = float(np.clip(
-            threshold, self.qifl_threshold_lower_bound, self.qifl_threshold_upper_bound))
-        state['adaptive_charge_threshold'] = threshold
-        try:
-            self.metrics.adaptive_charge_thresholds.append(threshold)
-        except Exception:
-            pass
-        return threshold
-
-    def _compute_sos_threshold_energy(self, node_id):
-        state = self.node_states.get(node_id, {})
-        routes = self.routing_tables.get(node_id, {}) or {}
-        primary_path = routes.get('primary_path') or []
-        h_i = max(1, len(primary_path) - 1) if primary_path else 1
-        E_tx = float(self.ablation.get('sos_control_tx_energy_j', 1.0e-6))
-        prr = float(state.get('PRR_to_next',
-                    self.ablation.get('default_link_prr', 0.92)))
-        retries = int(self.ablation.get('mac_retry_budget', 3))
-        success_factor = 1.0 / max(1e-6, 1.0 - (1.0 - prr) ** max(1, retries))
-        margin = float(self.ablation.get('sos_energy_margin_j', 2.5e-4))
-        thresh = h_i * E_tx * success_factor + margin
-        try:
-            self.metrics.sos_threshold_energies.append(float(thresh))
-        except Exception:
-            pass
-        return float(thresh)
-
-    def _base_charging_security_ok(self, node_id):
-        state = self.node_states.get(node_id)
-        if state is None or node_id == self.BS_ID:
-            return False
-        if state.get('status', 'WHITELISTED') in ('BLACKLISTED', 'QUARANTINE') or state.get('hard_veto', False):
-            return False
-        if float(state.get('Deviation_MC_norm', 0.0)) > self.CHARGE_MAX_DEVIATION_MC_NORM:
-            return False
-        if float(state.get('SED_index', 0.0)) >= self.CHARGE_MAX_SED:
-            return False
-        if float(state.get('spoof_trust', 1.0)) < self.CHARGE_MIN_SPOOF_TRUST:
-            return False
-        return True
-
-    def _active_mobile_chargers(self, require_idle=False):
-        """Return usable mobile chargers without changing single-MC behavior."""
-        chargers = list(getattr(self, 'mc_references', []) or [])
-        if not chargers and self.mc_reference is not None:
-            chargers = [self.mc_reference]
-        usable = []
-        for charger in chargers:
-            if charger is None:
-                continue
-            if getattr(charger, 'zeroized', False) or getattr(charger, 'requires_lab_reprovisioning', False):
-                continue
-            if require_idle and getattr(charger, 'status', 'IDLE') != 'IDLE':
-                continue
-            usable.append(charger)
-        return usable
-
-    def _charger_travel_time_distance(self, node_id, charger=None):
-        node_obj = self.network_nodes.get(node_id)
-        if node_obj is None:
-            return 0.0, 0.0
-        candidates = [charger] if charger is not None else self._active_mobile_chargers(
-            require_idle=True)
-        fleet = list(getattr(self, 'mc_references', []) or [])
-        if not candidates and self.mc_reference is not None and len(fleet) <= 1:
-            candidates = [self.mc_reference]
-        best = None
-        for mc in candidates:
-            if mc is None:
-                continue
-            dist = math.hypot(float(mc.x) - float(node_obj.x),
-                              float(mc.y) - float(node_obj.y))
-            travel = dist / max(float(getattr(mc, 'speed', 1.0)), 1e-6)
-            item = (travel, dist)
-            if best is None or item < best:
-                best = item
-        return best if best is not None else (0.0, 0.0)
-
-    def charging_dispatch_priority(self, node_id, current_time=None, mc_x=None, mc_y=None, mc_speed=None):
-        st = self.node_states.get(node_id, {})
-        now = self._now() if current_time is None else float(current_time)
-        e = self._estimate_energy_now(node_id, now)
-        e0 = float(st.get('E_initial', 1.0))
-        q = float(st.get('energy_q_ewma', 0.0))
-        # Fallback to the known idle floor only for deadline ordering, not for
-        # security decisions or trust scores.
-        if self.energy_experiment_active:
-            q = max(q, float(self.ablation.get(
-                'idle_sensing_power_j_per_s', 0.0)))
-        ttd = e / max(q, 1e-12) if q > 0 else 1e6
-        node = self.network_nodes.get(node_id)
-        if node is not None and mc_x is not None and mc_y is not None:
-            dist = math.hypot(float(mc_x) - float(node.x),
-                              float(mc_y) - float(node.y))
-            speed = float(mc_speed) if mc_speed is not None else (float(getattr(
-                self.mc_reference, 'speed', 1.0)) if self.mc_reference is not None else 1.0)
-            travel = dist / max(speed, 1e-6)
-        else:
-            travel, dist = self._charger_travel_time_distance(node_id)
-        slack = ttd - travel
-        e_ratio = e / max(e0, 1e-12)
-        hard = slack <= self.hard_deadline_margin_s or e_ratio <= float(
-            self.ablation.get('critical_energy_ratio', 0.15))
-        return (0 if hard else 1, slack, dist, e_ratio)
-
-    def is_deadline_rescue_node(self, node_id, current_time=None):
-        return self.charging_dispatch_priority(node_id, current_time=current_time)[0] == 0
-
-    def _admit_charging_node(self, node_id, emergency=False):
-        """Runtime guard layer: security first, then QIFL/SOS admission and hysteresis."""
-        state = self.node_states.get(node_id)
-        if state is None or not self._base_charging_security_ok(node_id):
-            return False
-        now = self._now()
-        E0 = float(state.get('E_initial', 1.0))
-        E_est = self._estimate_energy_now(node_id, now)
-        e_ratio = E_est / max(E0, 1e-12)
-        E_claimed = float(state.get('E_claimed', E_est))
-        max_claim_dev = float(getattr(self, 'CHARGE_MAX_CLAIM_EST_DEVIATION',
-                                      self.ablation.get('charge_claim_est_max_deviation', 0.30)))
-        if abs(E_claimed - E_est) / max(E0, 1e-12) > max_claim_dev:
-            return False
-        hysteresis_enabled = bool(self.ablation.get(
-            'use_charging_hysteresis', True))
-        if hysteresis_enabled and e_ratio >= self.post_charge_release_ratio:
-            state['charge_satisfied'] = True
-            return False
-        cooldown = self.charging_reentry_cooldown_s if hysteresis_enabled else 0.0
-        if cooldown > 0 and (now - self.last_charge_time_by_node[node_id]) < cooldown and not emergency:
-            return False
-        if cooldown > 0 and (now - self.last_selected_charge_time_by_node[node_id]) < max(5.0, 0.25 * cooldown) and not emergency:
-            return False
-        threshold = self.get_adaptive_charge_threshold_for_node(node_id)
-        sos_energy = self._compute_sos_threshold_energy(node_id)
-        useful_gap_ratio = max(0.0, (E0 - E_est) / max(E0, 1e-12))
-        q = float(state.get('energy_q_ewma', 0.0))
-        if self.energy_experiment_active:
-            q = max(q, float(self.ablation.get(
-                'idle_sensing_power_j_per_s', 0.0)))
-        ttd = E_est / max(q, 1e-12) if q > 0 else 1e6
-        travel, distance = self._charger_travel_time_distance(node_id)
-        horizon = float(self.ablation.get('charge_deadline_horizon_s', 900.0))
-        predicted_urgent = ttd <= (travel + horizon)
-        energy_admit = e_ratio <= threshold
-        sos_admit = E_est <= max(sos_energy, float(
-            self.ablation.get('emergency_ratio', 0.12)) * E0)
-        slack_after_travel = ttd - travel
-        hard_rescue = slack_after_travel <= self.hard_deadline_margin_s or e_ratio <= float(
-            self.ablation.get('critical_energy_ratio', 0.15))
-        if not emergency and useful_gap_ratio < self.min_charge_energy_ratio and not sos_admit and not hard_rescue:
-            return False
-        travel_gate_ok = True
-        if self.use_travel_aware_admission and not (emergency or sos_admit or hard_rescue):
-            diag = float(self.ablation.get('network_diagonal', 141.421356))
-            normalized_distance = min(
-                1.0, max(0.0, distance) / max(diag, 1e-6))
-            threshold_pressure = max(
-                0.0, (threshold - e_ratio) / max(threshold, 1e-12))
-            deadline_pressure = 1.0 - \
-                min(1.0, max(0.0, slack_after_travel) / max(horizon, 1e-6))
-            energy_urgency = max(threshold_pressure, 0.65 *
-                                 deadline_pressure + 0.35 * useful_gap_ratio)
-            effective_urgency = energy_urgency / \
-                (1.0 + self.travel_admission_lambda * normalized_distance)
-            state['travel_effective_urgency'] = float(effective_urgency)
-            state['travel_normalized_distance'] = float(normalized_distance)
-            travel_gate_ok = effective_urgency >= self.travel_admission_gate
-        admitted = bool(emergency or sos_admit or hard_rescue or (
-            (energy_admit or predicted_urgent) and travel_gate_ok))
-        if admitted and self.use_adaptive_quantum_charging:
-            try:
-                self.metrics.qifl_admission_count += 1
-            except Exception:
-                pass
-        return admitted
-
-    def build_adaptive_charging_queue(self, idle_charger_count=None):
-        """Create a K-Means/priority-filtered queue of crisis nodes for the MC layer.
-
-        When multiple chargers are enabled, k-means creates one spatial service
-        area per idle charger (bounded by the number of candidates).  The flat
-        queue remains available for backward compatibility with the single-MC
-        service loop, while current_charging_clusters exposes the per-area
-        assignments used by the multi-MC dispatcher.
+        ``self.routing_tables`` remains the original control/charging routing
+        substrate.  ``self.data_routing_tables`` is the only table modified by
+        the clustered/MST overlay.  Consequently QIFL, DQN, charging admission,
+        CH urgency, SOS thresholds, fixed-charger placement, and charger travel
+        decisions retain their original inputs and parameters.
         """
-        if not self.energy_experiment_active:
-            self.secure_charging_queue = []
-            self.current_charging_clusters = {}
-            return []
-        candidate_ids = []
-        for nid in list(self.node_states.keys()):
-            if nid == self.BS_ID:
-                continue
-            emergency = nid in self.pending_sos_requests
-            if self._admit_charging_node(nid, emergency=emergency):
-                candidate_ids.append(nid)
-        if not candidate_ids:
-            self.secure_charging_queue = []
-            self.current_charging_clusters = {}
-            try:
-                self.metrics.charging_kmeans_cluster_counts.append(0)
-                self.metrics.charging_cluster_assigned_node_counts.append(0)
-            except Exception:
-                pass
-            return []
-        # Prioritize nodes by deadline slack after MC travel while keeping the
-        # candidate count bounded.
-
-        def priority(nid):
-            # Use the nearest idle charger when a fleet is active; with one MC this
-            # is identical to the previous single-charger priority.
-            return self.charging_dispatch_priority(nid)
-        max_queue = int(self.ablation.get('max_adaptive_charge_queue', 8))
-        candidate_ids = sorted(candidate_ids, key=priority)[:max_queue]
-        if idle_charger_count is None:
-            idle_chargers = 1
-            if self.mc_reference is not None and getattr(self.mc_reference, 'status', 'IDLE') != 'IDLE':
-                idle_chargers = 0
-        else:
-            idle_chargers = int(max(0, idle_charger_count))
-        k = max(1, min(len(candidate_ids), max(1, idle_chargers)))
-        clusters = {0: list(candidate_ids)}
-        if len(candidate_ids) >= 2 and k > 1:
-            try:
-                coords = np.array([[self.node_states[nid]['x'], self.node_states[nid]['y']]
-                                  for nid in candidate_ids], dtype=float)
-                labels = KMeans(n_clusters=k, random_state=42,
-                                n_init=10).fit_predict(coords)
-                clusters = {int(lbl): [nid for nid, l in zip(candidate_ids, labels) if int(
-                    l) == int(lbl)] for lbl in sorted(set(labels))}
-            except Exception:
-                clusters = {0: list(candidate_ids)}
-        # Single-MC simulation exposes one sorted queue. Multi-MC dispatchers
-        # additionally consume current_charging_clusters for collision-safe areas.
-        self.current_charging_clusters = clusters
-        self.secure_charging_queue = list(candidate_ids)
-        try:
-            self.metrics.charging_kmeans_cluster_counts.append(
-                float(len(clusters)))
-            self.metrics.charging_cluster_assigned_node_counts.append(
-                float(len(candidate_ids)))
-        except Exception:
-            pass
-        return self.secure_charging_queue
-
-    def validate_charging_request(self, node_id, emergency=False):
-        # Keep raw-SOS/no-validation ablation semantics intact.
-        if not self.ablation.get('use_secure_charging_request_validation', True):
-            self.metrics.mc_raw_sos_dispatches += 1
-            ok = node_id in self.node_states and node_id != self.BS_ID
-        elif self.energy_experiment_active and (
-                self.use_adaptive_quantum_charging or
-                self.ablation.get('use_adaptive_charge_guards', False)):
-            ok = self._admit_charging_node(node_id, emergency=emergency)
-        else:
-            ok = False
-            state = self.node_states.get(node_id)
-            if state is not None and node_id != self.BS_ID:
-                if state.get('status', 'WHITELISTED') not in ('BLACKLISTED', 'QUARANTINE') and not state.get('hard_veto', False):
-                    if float(state.get('Deviation_MC_norm', 0.0)) <= self.CHARGE_MAX_DEVIATION_MC_NORM and float(state.get('SED_index', 0.0)) < self.CHARGE_MAX_SED and float(state.get('spoof_trust', 1.0)) >= self.CHARGE_MIN_SPOOF_TRUST:
-                        E_initial = float(state.get('E_initial', 1.0))
-                        E_est = float(state.get('E_est', E_initial))
-                        E_claimed = float(state.get('E_claimed', E_est))
-                        max_claim_dev = float(getattr(self, 'CHARGE_MAX_CLAIM_EST_DEVIATION', self.ablation.get(
-                            'charge_claim_est_max_deviation', 0.30)))
-                        if abs(E_claimed - E_est) / max(E_initial, 1e-12) <= max_claim_dev:
-                            threshold = float(self.CHARGE_NEED_RATIO if not emergency else max(
-                                self.CHARGE_NEED_RATIO, 0.35))
-                            ok = (E_est / max(E_initial, 1e-12)) <= threshold
-
-            if not ok and self.energy_experiment_active and self.ablation.get('allow_energy_stress_predictive_charging', False):
-                state = self.node_states.get(node_id)
-                if state is not None and node_id != self.BS_ID:
-                    if state.get('status') not in ('BLACKLISTED', 'QUARANTINE') and not state.get('hard_veto', False):
-                        if float(state.get('Deviation_MC_norm', 0.0)) <= self.CHARGE_MAX_DEVIATION_MC_NORM and float(state.get('SED_index', 0.0)) < self.CHARGE_MAX_SED and float(state.get('spoof_trust', 1.0)) >= self.CHARGE_MIN_SPOOF_TRUST:
-                            E_initial = float(state.get('E_initial', 1.0))
-                            E_est = float(state.get('E_est', E_initial))
-                            ok = (E_est / max(E_initial, 1e-12)) <= float(
-                                self.ablation.get('charge_need_ratio', self.CHARGE_NEED_RATIO))
-
-        if emergency:
-            self.metrics.raw_sos_validation_attempts += 1
-            if not ok:
-                self.metrics.raw_sos_blocked += 1
-
-        if self.energy_experiment_active:
-            if node_id in self.pending_sos_requests or node_id in self.secure_charging_queue:
-                current_t = float(
-                    getattr(self.metrics, 'current_sim_time', 0.0))
-                self.metrics.record_charging_request(
-                    node_id, current_t, validated=ok)
-        return bool(ok)
-
-    def _joint_optimization(self, U_malicious_dict, network_clusters):
         node_penalties = {}
         active_nodes = {}
         shadow_penalties = {}
@@ -1614,25 +1461,44 @@ class BaseStation:
             else:
                 shadow_penalties[nid] = node_penalties[nid]
 
-        route_signature = tuple(sorted(nid for nid in self.node_states if nid !=
-                                self.BS_ID and self.node_states[nid].get('status') == 'BLACKLISTED'))
-        warning_set = tuple(sorted(nid for nid in self.node_states if nid != self.BS_ID and (self.node_states[nid].get(
-            'FE', 1.0) <= self.T_WARNING_FE or self.node_states[nid].get('status') in ('WATCHLIST', 'QUARANTINE'))))
+        route_signature = tuple(sorted(
+            nid for nid in self.node_states
+            if nid != self.BS_ID
+            and self.node_states[nid].get('status') == 'BLACKLISTED'))
+        warning_set = tuple(sorted(
+            nid for nid in self.node_states
+            if nid != self.BS_ID and (
+                self.node_states[nid].get('FE', 1.0) <= self.T_WARNING_FE
+                or self.node_states[nid].get('status') in ('WATCHLIST', 'QUARANTINE'))))
         shadow_signature = warning_set
         force_periodic_refresh = (
-            self.ROUTE_RECOMPUTE_PERIOD is not None and self.control_epoch_index % self.ROUTE_RECOMPUTE_PERIOD == 0)
+            self.ROUTE_RECOMPUTE_PERIOD is not None
+            and self.control_epoch_index % self.ROUTE_RECOMPUTE_PERIOD == 0)
         active_changed = route_signature != self._last_route_signature
         shadow_changed = shadow_signature != self._last_shadow_signature
         self.routes_updated = False
+
+        # DATA routing has its own refresh cadence.  This does not alter the
+        # original reference route-recompute period used by charging/control.
+        data_period = self.ablation.get('data_route_recompute_period', 5)
+        try:
+            data_period = max(1, int(data_period))
+        except (TypeError, ValueError):
+            data_period = 5
+        force_data_refresh = self.control_epoch_index % data_period == 0
 
         if critical_nodes and self.standby_routing_tables is not None:
             _shadow_activation_t0 = time.time()
             self.routing_tables = self.standby_routing_tables
             self.standby_routing_tables = None
+            if self.data_standby_routing_tables is not None:
+                self.data_routing_tables = self.data_standby_routing_tables
+                self.data_standby_routing_tables = None
             self._last_route_signature = route_signature
             self.routes_updated = True
             self.metrics.record_shadow_route_result(
-                hit=True, shadow_ms=(time.time() - _shadow_activation_t0) * 1000.0)
+                hit=True,
+                shadow_ms=(time.time() - _shadow_activation_t0) * 1000.0)
         elif active_changed or force_periodic_refresh or not self.routing_tables:
             _ordinary_route_t0 = time.time()
             self.routing_tables = self.routing_engine.compute_routing_tables(
@@ -1642,41 +1508,913 @@ class BaseStation:
             self.metrics.record_shadow_route_result(
                 ordinary_ms=(time.time() - _ordinary_route_t0) * 1000.0)
 
+        # Recompute enhanced DATA routes without changing any charging table.
+        if self.data_routing_engine is not None and (
+                self.routes_updated or force_data_refresh
+                or not self.data_routing_tables):
+            self.data_routing_tables = self.data_routing_engine.compute_routing_tables(
+                active_nodes, node_penalties,
+                reference_tables=self.routing_tables)
+            self._last_data_route_signature = (
+                route_signature, self.control_epoch_index // data_period)
+            try:
+                diag = dict(getattr(
+                    self.data_routing_engine, 'last_diagnostics', {}) or {})
+                self.metrics.record_data_routing_diagnostics(diag)
+            except Exception:
+                pass
+
         if needs_shadow_calc:
             if shadow_changed or force_periodic_refresh or self.standby_routing_tables is None:
                 _shadow_pre_t0 = time.time()
                 self.standby_routing_tables = self.routing_engine.compute_routing_tables(
                     shadow_active_nodes, shadow_penalties)
+                if self.data_routing_engine is not None:
+                    self.data_standby_routing_tables = (
+                        self.data_routing_engine.compute_routing_tables(
+                            shadow_active_nodes, shadow_penalties,
+                            reference_tables=self.standby_routing_tables))
                 self._last_shadow_signature = shadow_signature
                 self.metrics.record_shadow_route_result(
-                    precomputed=True, extra_compute_ms=(time.time() - _shadow_pre_t0) * 1000.0)
+                    precomputed=True,
+                    extra_compute_ms=(time.time() - _shadow_pre_t0) * 1000.0)
         else:
             self.standby_routing_tables = None
+            self.data_standby_routing_tables = None
             self._last_shadow_signature = None
 
-        if self.energy_experiment_active and (self.use_adaptive_quantum_charging or self.ablation.get('use_adaptive_charge_guards', False)):
-            self.build_adaptive_charging_queue()
-        else:
-            secure_sos_queue = [
-                nid for nid in self.pending_sos_requests if self.validate_charging_request(nid, emergency=True)]
-            self.secure_charging_queue = secure_sos_queue if self.energy_experiment_active else []
-        self.pending_sos_requests.clear()
+        # Important: cluster_heads used by charging are still extracted from
+        # self.routing_tables (the original reference plane), not DATA routes.
+        self._network_clustering()
 
-    def verify_charging_location(self, node_id, mc_x, mc_y):
-        self.metrics.mc_location_spoof_attempts += 1
-        if not self.ablation.get('use_mc_location_verification', True):
-            if node_id in self.node_states:
-                self.node_states[node_id]['spoof_trust'] = 1.0
-            self.metrics.mc_location_spoof_accepted += 1
+    def _verify_wrsn_cyber_physical_security(self):
+        if not self.ablation.get('use_zero_overhead_spoof_detection', True):
+            for nid in list(self.mc_recent_injected_energy.keys()):
+                self.mc_recent_injected_energy[nid] = 0.0
             return
-        if node_id in self.node_states:
-            claimed_x = self.node_states[node_id]['x']
-            claimed_y = self.node_states[node_id]['y']
-            distance = math.hypot(mc_x - claimed_x, mc_y - claimed_y)
-            if distance > 5.0:
-                self.node_states[node_id]['spoof_trust'] = 0.0
+
+        for nid, state in self.node_states.items():
+            if nid == self.BS_ID or state['status'] == 'BLACKLISTED':
+                continue
+
+            E_max = state['E_initial']
+            E_claimed_t = state.get('E_claimed', E_max)
+            E_claimed_t_minus_1 = state.get('E_claimed_prev', E_max)
+            E_injected = self.mc_recent_injected_energy.get(nid, 0.0)
+
+            delta_claimed = E_claimed_t - E_claimed_t_minus_1
+            deviation_mc = abs(delta_claimed - E_injected)
+
+            tolerance = 0.05 * E_max
+            state['Deviation_MC'] = deviation_mc
+            state['Deviation_MC_norm'] = min(
+                1.0, deviation_mc / max(tolerance, 1e-12))
+
+            legitimate_credit = bool(
+                state.get('legitimate_mc_credit_pending', False))
+            if deviation_mc > (2.0 * tolerance):
+                if E_injected > 0 and delta_claimed <= tolerance and not legitimate_credit:
+                    self.metrics.charge_hoarder_attempts += 1
+                    self.metrics.charge_hoarder_detections += 1
+                    print(
+                        f"[WRSN SECURITY] Charge Hoarding detected at Node {nid}! Hard veto triggered.")
+                    state['hard_veto'] = True
+                    state['status'] = 'BLACKLISTED'
+                    state['FE'] = 0.0
+                elif (E_injected == 0 and delta_claimed > tolerance and
+                      not legitimate_credit and nid not in self.fixed_charger_nodes):
+                    rise_ratio = delta_claimed / max(E_max, 1e-12)
+                    count = int(
+                        state.get('unexplained_energy_rise_count', 0)) + 1
+                    state['unexplained_energy_rise_count'] = count
+                    confirmed = rise_ratio >= 0.30 or count >= 3
+                    if confirmed:
+                        self.metrics.fake_charger_attempts += 1
+                        self.metrics.fake_charger_detections += 1
+                        print(
+                            f"[WRSN SECURITY] Confirmed fake-charger energy rise at Node {nid}.")
+                        state['hard_veto'] = True
+                        state['status'] = 'BLACKLISTED'
+                        state['FE'] = 0.0
+                    else:
+                        state['status'] = 'WATCHLIST'
+                else:
+                    state['unexplained_energy_rise_count'] = max(
+                        0, int(state.get('unexplained_energy_rise_count', 0)) - 1)
             else:
-                self.node_states[node_id]['spoof_trust'] = 1.0
+                state['unexplained_energy_rise_count'] = max(
+                    0, int(state.get('unexplained_energy_rise_count', 0)) - 1)
+
+            t2_current = state.get('T2_history', 1.0)
+            already_rescued = state.get('spoof_rescue_triggered', False)
+
+            if t2_current > 0.8:
+                state['spoof_rescue_triggered'] = False
+
+            if (t2_current < 0.5 and delta_claimed <= 0 and
+                    E_injected == 0 and not already_rescued and
+                    not self._node_energy_or_topology_impaired(nid)):
+                print(
+                    f"[WRSN SECURITY] Spoofing Attack detected affecting Node {nid}! Triggering Incident Response.")
+                self.trigger_incident_response(
+                    victim_id=nid, spoof_x=state['x'], spoof_y=state['y'])
+                state['spoof_rescue_triggered'] = True
+
+            state['E_claimed_prev'] = E_claimed_t
+            state['legitimate_mc_credit_pending'] = False
+            self.mc_recent_injected_energy[nid] = 0.0
+
+    def _verify_stealthy_attackers(self):
+        if not self.ablation.get('use_stealthy_attacker_detection', True):
+            return
+        kappa = 5.0
+        veto_threshold = 0.4
+        for nid, state in self.node_states.items():
+            if nid == self.BS_ID or state.get('status') == 'BLACKLISTED':
+                continue
+            if self._node_energy_or_topology_impaired(nid):
+                state['S_stealth'] = 0.0
+                state['confirmed_stealth_attack'] = False
+                continue
+            t2 = float(state.get('T2_history', 1.0))
+            e_est = float(state.get('E_est', state['E_initial']))
+            e_claimed = float(state.get('E_claimed', state['E_initial']))
+            e_max = max(float(state['E_initial']), 1e-12)
+            drop_rate = 1.0 - t2
+            energy_diff = max(0.0, e_est - e_claimed)
+            alibi_penalty = 1.0 - math.exp(-kappa * (energy_diff / e_max))
+            score = drop_rate * alibi_penalty
+            state['S_stealth'] = score
+
+            corroborated = bool(
+                int(state.get('packet_auth_failures', 0)) > 0
+                or int(state.get('sequence_replay_count', 0)) > 0
+                or float(state.get('Deviation_MC_norm', 0.0)) >
+                self.CHARGE_MAX_DEVIATION_MC_NORM
+                or float(state.get('spoof_trust', 1.0)) <
+                self.CHARGE_MIN_SPOOF_TRUST)
+            state['confirmed_stealth_attack'] = bool(
+                score >= veto_threshold and corroborated)
+            if state['confirmed_stealth_attack']:
+                print(
+                    f"[WRSN SECURITY] Corroborated stealth attacker at Node {nid}; S={score:.3f}.")
+                state['hard_veto'] = True
+                state['status'] = 'BLACKLISTED'
+                state['FE'] = 0.0
+            elif score >= veto_threshold:
+                state['status'] = 'WATCHLIST'
+
+    def _verify_trajectory_manipulators(self):
+        if not self.ablation.get(
+                'use_sed_filter',
+                self.ablation.get('use_zero_overhead_spoof_detection', True)):
+            return
+        bs_x = self.network_nodes[self.BS_ID].x
+        bs_y = self.network_nodes[self.BS_ID].y
+        non_bs_states = [state for nid, state in self.node_states.items()
+                         if nid != self.BS_ID]
+        if not non_bs_states:
+            return
+        d_max = max(math.hypot(state['x'] - bs_x, state['y'] - bs_y)
+                    for state in non_bs_states)
+        d_max = max(d_max, 1e-6)
+        epsilon = 1e-6
+
+        for nid, state in self.node_states.items():
+            if nid == self.BS_ID:
+                continue
+            e_prev = state.get('E_claimed_prev_SED', state['E_initial'])
+            e_curr = state.get('E_claimed', state['E_initial'])
+            state['delta_E'] = max(0.0, e_prev - e_curr)
+            state['E_claimed_prev_SED'] = e_curr
+            state['confirmed_sed_attack'] = False
+
+        for nid in list(self.pending_sos_requests):
+            state = self.node_states.get(nid)
+            if not state or state.get('status') == 'BLACKLISTED':
+                self.pending_sos_requests.discard(nid)
+                continue
+            if self._node_energy_or_topology_impaired(nid):
+                state['SED_index'] = 0.0
+                continue
+
+            delta_i = float(state.get('delta_E', 0.0))
+            neighbor_deltas = []
+            for other_nid, other_state in self.node_states.items():
+                if other_nid in (nid, self.BS_ID):
+                    continue
+                dist = math.hypot(
+                    state['x'] - other_state['x'],
+                    state['y'] - other_state['y'])
+                if dist <= 30.0 and not self._node_energy_or_topology_impaired(other_nid):
+                    neighbor_deltas.append(float(
+                        other_state.get('delta_E', 0.0)))
+
+            mu = float(np.mean(neighbor_deltas)) if neighbor_deltas else 0.0
+            sigma = float(np.std(neighbor_deltas)) if neighbor_deltas else 0.0
+            d_bs = math.hypot(state['x'] - bs_x, state['y'] - bs_y)
+            z_score = abs(delta_i - mu) / (sigma + epsilon)
+            sed_raw = z_score * (1.0 + d_bs / d_max)
+
+            corroborated = bool(
+                int(state.get('packet_auth_failures', 0)) > 0
+                or int(state.get('sequence_replay_count', 0)) > 0
+                or float(state.get('Deviation_MC_norm', 0.0)) >
+                self.CHARGE_MAX_DEVIATION_MC_NORM
+                or float(state.get('spoof_trust', 1.0)) <
+                self.CHARGE_MIN_SPOOF_TRUST)
+            confirmed = sed_raw >= 3.0 and corroborated
+            state['confirmed_sed_attack'] = bool(confirmed)
+            state['SED_index'] = float(
+                sed_raw if confirmed else min(sed_raw, 1.5))
+
+            if confirmed:
+                print(
+                    f"[WRSN SECURITY] Corroborated trajectory manipulation at Node {nid}; SED={sed_raw:.2f}.")
+                state['hard_veto'] = True
+                state['status'] = 'BLACKLISTED'
+                state['FE'] = 0.0
+                self.pending_sos_requests.discard(nid)
+            elif sed_raw >= 3.0:
+                state['status'] = 'WATCHLIST'
+
+    def get_blacklisted_nodes(self):
+        return [nid for nid, state in self.node_states.items() if state.get('status') == 'BLACKLISTED']
+
+    def get_adaptive_threshold_for_node(self, node_id):
+        if not self.ablation.get('use_adaptive_edge_threshold', True):
+            return self.default_threshold
+        history = self.environmental_history.get(node_id, [])
+        if len(history) < 5:
+            return self.default_threshold
+        mu = float(np.mean(history))
+        sigma = float(np.std(history))
+        return mu + self.threshold_k * sigma
+
+    def estimate_service_latency_s(self, node_id, current_time=None, charger=None):
+        now = self._now() if current_time is None else float(current_time)
+        travel_time, _ = self._charger_travel_time_distance(
+            node_id, charger=charger)
+        fleet_size = max(
+            1, len(self._active_mobile_chargers(require_idle=False)))
+
+        recent_durations = list(
+            getattr(self.metrics, 'mc_service_durations', [])[-50:])
+        default_mission = float(self.ablation.get(
+            'adaptive_expected_mission_time_s', 30.0))
+        avg_mission = (float(np.mean(recent_durations))
+                       if recent_durations else default_mission)
+        avg_mission = max(1.0, avg_mission)
+
+        if getattr(self.metrics, 'rf_cluster_charge_events', 0) > 0:
+            avg_cluster_size = self.metrics._safe_rate(
+                self.metrics.rf_total_nodes_charged_in_clusters,
+                self.metrics.rf_cluster_charge_events)
+        else:
+            avg_cluster_size = float(self.ablation.get(
+                'expected_nodes_per_charge_stop', 2.0))
+        avg_cluster_size = max(1.0, avg_cluster_size)
+
+        service_ids = set(getattr(self, 'service_charging_node_ids', set()))
+        sos_ids = set(getattr(self, 'pending_sos_requests', set()))
+        queue_nodes = max(len(service_ids | sos_ids), 1)
+        max_batches = max(1, int(self.ablation.get(
+            'max_service_latency_batches', 6)))
+        batches_ahead = max(0, int(math.ceil(
+            max(0, queue_nodes - 1) / (fleet_size * avg_cluster_size))))
+        batches_ahead = min(batches_ahead, max_batches)
+        queue_time = batches_ahead * avg_mission
+
+        state = self.node_states.get(node_id, {})
+        node = self.network_nodes.get(node_id)
+        e_max = max(
+            float(getattr(node, 'E_max', state.get('E_initial', 1.0))), 1e-12)
+        e_now = max(0.0, float(
+            getattr(node, 'E_current', state.get('E_est', e_max))))
+        target_ratio = float(self.ablation.get(
+            'post_charge_release_ratio', 0.88))
+        gap = max(0.0, target_ratio * e_max - e_now)
+        charge_power = max(
+            float(self.ablation.get('charging_rate', 5.0)), 1e-12)
+        if self.use_rf_multi_node_charging:
+            radius = max(float(self.ablation.get(
+                'rf_charging_radius', 25.0)), 0.0)
+            d0 = max(float(self.ablation.get(
+                'rf_reference_distance_m', 1.0)), 1e-6)
+            alpha = max(float(self.ablation.get(
+                'rf_path_loss_exponent', 2.0)), 0.1)
+            eta = float(np.clip(self.ablation.get(
+                'rf_energy_conversion_efficiency', 0.70), 0.0, 1.0))
+            charge_power = max(
+                charge_power * eta / (1.0 + (radius / d0) ** alpha),
+                float(self.ablation.get('rf_min_effective_receive_power_w', 1e-4)))
+        charge_time = gap / max(charge_power, 1e-12)
+        margin = max(0.0, float(self.ablation.get(
+            'service_latency_safety_margin_s',
+            self.ablation.get('hard_deadline_margin_s', 90.0))))
+        latency = queue_time + max(0.0, travel_time) + charge_time + margin
+        state['estimated_service_latency_s'] = float(latency)
+        state['estimated_queue_wait_s'] = float(queue_time)
+        state['estimated_service_at_time'] = float(now)
+        return float(latency)
+
+    def _observe_energy_report(self, node_id, reported_energy, receive_time):
+        state = self.node_states.get(node_id)
+        if state is None:
+            return
+        now = float(receive_time)
+        reported_energy = float(max(0.0, reported_energy))
+        last_t = state.get('energy_last_report_time')
+        last_e = state.get('energy_last_reported')
+        if last_t is not None and last_e is not None:
+            dt = max(1e-9, now - float(last_t))
+            q_inst = max(0.0, (float(last_e) - reported_energy) / dt)
+            beta = float(self.ablation.get('energy_ewma_beta',
+                         self.ablation.get('ewma_beta', 0.70)))
+            q_prev = float(state.get('energy_q_ewma', q_inst))
+            state['energy_q_ewma'] = beta * q_inst + (1.0 - beta) * q_prev
+            pred_before_report = state.get('E_est', reported_energy)
+            try:
+                self.metrics.ewma_energy_abs_errors.append(
+                    abs(float(pred_before_report) - reported_energy))
+            except Exception:
+                pass
+        else:
+            state.setdefault('energy_q_ewma', 0.0)
+        state['energy_last_report_time'] = now
+        state['energy_last_reported'] = reported_energy
+        state['E_est'] = max(
+            0.0, min(float(state.get('E_initial', reported_energy)), reported_energy))
+
+    def _estimate_energy_now(self, node_id, current_time=None):
+        state = self.node_states.get(node_id)
+        if state is None:
+            return 0.0
+        E0 = float(state.get('E_initial', 1.0))
+        now = self._now() if current_time is None else float(current_time)
+        last_e = float(
+            state.get('energy_last_reported', state.get('E_est', E0)))
+        last_t = float(state.get('energy_last_report_time', now))
+        q = self._effective_depletion_rate(node_id, now)
+        predicted = max(0.0, min(E0, last_e - q * max(0.0, now - last_t)))
+        service_est = float(state.get('E_est', predicted))
+        node = self.network_nodes.get(node_id)
+        physical_est = float(getattr(node, 'E_current', predicted)
+                             ) if node is not None else predicted
+        predicted = min(predicted, min(E0, service_est), min(E0, physical_est))
+        state['E_est'] = predicted
+        return predicted
+
+    def _node_center_distance_norm(self, state):
+        if self.BS_ID in self.network_nodes:
+            bx = float(self.network_nodes[self.BS_ID].x)
+            by = float(self.network_nodes[self.BS_ID].y)
+        else:
+            xs = [float(st.get('x', 0.0)) for st in self.node_states.values()]
+            ys = [float(st.get('y', 0.0)) for st in self.node_states.values()]
+            bx = float(np.mean(xs)) if xs else 0.0
+            by = float(np.mean(ys)) if ys else 0.0
+        return min(1.0, math.hypot(float(state.get('x', bx)) - bx, float(state.get('y', by)) - by) /
+                   max(float(self.ablation.get('network_diagonal', 141.421356)), 1e-6))
+
+    def _ideal_charge_threshold(self, node_id, e_ratio, ed_norm, sd_norm):
+        state = self.node_states.get(node_id, {})
+        q = self._effective_depletion_rate(node_id)
+        E0 = float(state.get('E_initial', 1.0))
+        ttd = (e_ratio * E0) / max(q, 1e-12) if q > 0 else 1e6
+        risk = float(state.get('risk_mean', state.get('fcm_risk', 0.0)))
+        path_len = len((self.routing_tables.get(node_id, {})
+                       or {}).get('primary_path', []) or [])
+        route_pressure = min(1.0, max(0, path_len - 2) / 8.0)
+        time_pressure = 1.0 - \
+            min(1.0, ttd / float(self.ablation.get('qifl_safe_horizon_s', 1800.0)))
+        target = 0.20 + 0.16 * time_pressure + 0.07 * \
+            sd_norm + 0.05 * risk + 0.04 * route_pressure
+        return float(np.clip(target, self.qifl_threshold_lower_bound, self.qifl_threshold_upper_bound))
+
+    def get_adaptive_charge_threshold_for_node(self, node_id):
+        state = self.node_states.get(node_id)
+        if state is None:
+            return float(self.ablation.get('charge_need_ratio', self.CHARGE_NEED_RATIO))
+        E0 = float(state.get('E_initial', 1.0))
+        E_est = self._estimate_energy_now(node_id)
+        q = self._effective_depletion_rate(node_id)
+        survival_time = E_est / \
+            max(q, 1e-12) if q > 0 else float(self.ablation.get('qifl_safe_horizon_s', 1800.0))
+        ed_norm = min(1.0, survival_time /
+                      max(float(self.ablation.get('qifl_safe_horizon_s', 1800.0)), 1e-6))
+        centrality = min(1.0, float(state.get('hop_count_to_bs_norm', 0.0)))
+        sd_norm = min(
+            1.0, 0.65 * self._node_center_distance_norm(state) + 0.35 * centrality)
+        if self.use_adaptive_quantum_charging:
+            threshold, _ = self.qifl_oracle.infer(ed_norm, sd_norm)
+            ideal = self._ideal_charge_threshold(
+                node_id, E_est / max(E0, 1e-12), ed_norm, sd_norm)
+            loss = self.qifl_oracle.train_step(ed_norm, sd_norm, ideal)
+            try:
+                self.metrics.qifl_training_losses.append(float(loss))
+            except Exception:
+                pass
+        else:
+            threshold = float(self.ablation.get(
+                'charge_need_ratio', self.CHARGE_NEED_RATIO))
+
+        q_effective = max(q, float(self.ablation.get(
+            'idle_sensing_power_j_per_s', 0.0)))
+        service_latency = self.estimate_service_latency_s(node_id)
+        sos_energy = self._compute_sos_threshold_energy(node_id)
+        rt_min_ratio = (q_effective * service_latency +
+                        sos_energy) / max(E0, 1e-12)
+
+        hard_cap = float(np.clip(self.ablation.get(
+            'adaptive_request_threshold_hard_cap', 0.68),
+            self.qifl_threshold_lower_bound, 1.0))
+        bounded_rt_min = min(float(rt_min_ratio), hard_cap)
+        threshold = float(np.clip(
+            max(float(threshold), bounded_rt_min),
+            self.qifl_threshold_lower_bound,
+            hard_cap))
+        state['adaptive_charge_threshold'] = threshold
+        state['adaptive_rt_min_ratio'] = float(rt_min_ratio)
+        state['adaptive_rt_min_overload'] = max(
+            0.0, float(rt_min_ratio) - hard_cap)
+        try:
+            self.metrics.adaptive_charge_thresholds.append(threshold)
+        except Exception:
+            pass
+        return threshold
+
+    def _compute_sos_threshold_energy(self, node_id):
+        state = self.node_states.get(node_id, {})
+        routes = self.routing_tables.get(node_id, {}) or {}
+        primary_path = routes.get('primary_path') or []
+        h_i = max(1, len(primary_path) - 1) if primary_path else 1
+        E_tx = float(self.ablation.get('sos_control_tx_energy_j', 1.0e-6))
+        prr = float(state.get('PRR_to_next',
+                    self.ablation.get('default_link_prr', 0.92)))
+        retries = int(self.ablation.get('mac_retry_budget', 3))
+        success_factor = 1.0 / max(1e-6, 1.0 - (1.0 - prr) ** max(1, retries))
+        margin = float(self.ablation.get('sos_energy_margin_j', 2.5e-4))
+        thresh = h_i * E_tx * success_factor + margin
+        state['last_sos_threshold_energy'] = float(thresh)
+        try:
+            self.metrics.sos_threshold_energies.append(float(thresh))
+        except Exception:
+            pass
+        return float(thresh)
+
+    def _base_charging_security_ok(self, node_id):
+        state = self.node_states.get(node_id)
+        if state is None or node_id == self.BS_ID:
+            return False
+        if state.get('status', 'WHITELISTED') in ('BLACKLISTED', 'QUARANTINE') or state.get('hard_veto', False):
+            return False
+        if float(state.get('Deviation_MC_norm', 0.0)) > self.CHARGE_MAX_DEVIATION_MC_NORM:
+            return False
+        if float(state.get('SED_index', 0.0)) >= self.CHARGE_MAX_SED:
+            return False
+        if float(state.get('spoof_trust', 1.0)) < self.CHARGE_MIN_SPOOF_TRUST:
+            return False
+        return True
+
+    def _active_mobile_chargers(self, require_idle=False):
+        chargers = list(getattr(self, 'mc_references', []) or [])
+        if not chargers and self.mc_reference is not None:
+            chargers = [self.mc_reference]
+        usable = []
+        for charger in chargers:
+            if charger is None:
+                continue
+            if getattr(charger, 'zeroized', False) or getattr(charger, 'requires_lab_reprovisioning', False):
+                continue
+            if require_idle and getattr(charger, 'status', 'IDLE') != 'IDLE':
+                continue
+            usable.append(charger)
+        return usable
+
+    def _charger_travel_time_distance(self, node_id, charger=None):
+        node_obj = self.network_nodes.get(node_id)
+        if node_obj is None:
+            return 0.0, 0.0
+        candidates = [charger] if charger is not None else self._active_mobile_chargers(
+            require_idle=True)
+        fleet = list(getattr(self, 'mc_references', []) or [])
+        if not candidates and self.mc_reference is not None and len(fleet) <= 1:
+            candidates = [self.mc_reference]
+        best = None
+        for mc in candidates:
+            if mc is None:
+                continue
+            dist = math.hypot(float(mc.x) - float(node_obj.x),
+                              float(mc.y) - float(node_obj.y))
+            travel = dist / max(float(getattr(mc, 'speed', 1.0)), 1e-6)
+            item = (travel, dist)
+            if best is None or item < best:
+                best = item
+        return best if best is not None else (0.0, 0.0)
+
+    def charging_dispatch_priority(self, node_id, current_time=None, mc_x=None, mc_y=None, mc_speed=None):
+        st = self.node_states.get(node_id, {})
+        now = self._now() if current_time is None else float(current_time)
+        e = self._estimate_energy_now(node_id, now)
+        e0 = float(st.get('E_initial', 1.0))
+        q = self._effective_depletion_rate(node_id, now)
+
+        # ---------------------------------------------------------
+        # [INNOVATION] CH-Aware Charging Urgency Boost
+        # If the node is a Cluster Head (or intermediate backbone node),
+        # its death would sever the connection for its entire cluster.
+        # We artificially inflate its depletion rate (q) so the Mobile Charger
+        # views it as a highly critical rescue mission.
+        is_ch = node_id in getattr(self, 'cluster_heads', {})
+        if is_ch:
+            q *= 1.5  # 50% urgency boost for Cluster Heads
+        # ---------------------------------------------------------
+
+        ttd = e / max(q, 1e-12) if q > 0 else 1e6
+        node = self.network_nodes.get(node_id)
+        if node is not None and mc_x is not None and mc_y is not None:
+            dist = math.hypot(float(mc_x) - float(node.x),
+                              float(mc_y) - float(node.y))
+            speed = float(mc_speed) if mc_speed is not None else (float(getattr(
+                self.mc_reference, 'speed', 1.0)) if self.mc_reference is not None else 1.0)
+            travel = dist / max(speed, 1e-6)
+        else:
+            travel, dist = self._charger_travel_time_distance(node_id)
+
+        slack = ttd - travel
+        e_ratio = e / max(e0, 1e-12)
+        hard = slack <= self.hard_deadline_margin_s or e_ratio <= float(
+            self.ablation.get('critical_energy_ratio', 0.15))
+
+        return (0 if hard else 1, slack, dist, e_ratio)
+
+    def _charging_pool_class(self, node_id, emergency=False):
+        if node_id in self.fixed_charger_nodes:
+            return None
+
+        state = self.node_states.get(node_id)
+        if state is None or not self._base_charging_security_ok(node_id):
+            return None
+        now = self._now()
+        e0 = max(float(state.get('E_initial', 1.0)), 1e-12)
+        e_est = self._estimate_energy_now(node_id, now)
+        e_ratio = e_est / e0
+        e_claimed = float(state.get('E_claimed', e_est))
+        max_claim_dev = float(getattr(
+            self, 'CHARGE_MAX_CLAIM_EST_DEVIATION',
+            self.ablation.get('charge_claim_est_max_deviation', 0.30)))
+        if abs(e_claimed - e_est) / e0 > max_claim_dev:
+            return None
+
+        hysteresis = bool(self.ablation.get('use_charging_hysteresis', True))
+        if hysteresis and e_ratio >= self.post_charge_release_ratio:
+            state['charge_satisfied'] = True
+            return None
+        cooldown = self.charging_reentry_cooldown_s if hysteresis else 0.0
+        if cooldown > 0.0 and not emergency:
+            if now - self.last_charge_time_by_node[node_id] < cooldown:
+                return None
+            selection_gap = max(5.0, 0.25 * cooldown)
+            if now - self.last_selected_charge_time_by_node[node_id] < selection_gap:
+                return None
+
+        threshold = self.get_adaptive_charge_threshold_for_node(node_id)
+        plus_fraction = float(np.clip(self.ablation.get(
+            'request_plus_fraction', 0.50), 0.0, 1.0))
+        plus_threshold = threshold + plus_fraction * (1.0 - threshold)
+        sos_energy = self._compute_sos_threshold_energy(node_id)
+        q = self._effective_depletion_rate(node_id, now)
+        ttd = e_est / max(q, 1e-12)
+        travel, distance = self._charger_travel_time_distance(node_id)
+        service_latency = self.estimate_service_latency_s(node_id)
+        critical_ratio = float(self.ablation.get(
+            'critical_energy_ratio', 0.15))
+        emergency_ratio = float(self.ablation.get('emergency_ratio', 0.12))
+        sos_admit = e_est <= max(sos_energy, emergency_ratio * e0)
+        hard_rescue = ttd <= service_latency or e_ratio <= critical_ratio
+        useful_gap_ratio = max(0.0, 1.0 - e_ratio)
+
+        if emergency or sos_admit or hard_rescue:
+            pool = 'service'
+        elif e_ratio <= threshold:
+            pool = 'service'
+        elif e_ratio <= plus_threshold:
+            pool = 'plus'
+        else:
+            return None
+
+        if (not emergency and pool == 'service' and
+                useful_gap_ratio < self.min_charge_energy_ratio):
+            return None
+
+        if self.use_travel_aware_admission and not (
+                emergency or sos_admit or hard_rescue):
+            diag = float(self.ablation.get('network_diagonal', 141.421356))
+            normalized_distance = min(
+                1.0, max(0.0, distance) / max(diag, 1e-6))
+            slack_to_service = ttd - service_latency
+            horizon = max(service_latency, float(self.ablation.get(
+                'charge_deadline_horizon_s', 900.0)))
+            threshold_pressure = max(
+                0.0, (threshold - e_ratio) / max(threshold, 1e-12))
+            deadline_pressure = 1.0 - min(
+                1.0, max(0.0, slack_to_service) / max(horizon, 1e-6))
+            urgency = max(
+                threshold_pressure,
+                0.65 * deadline_pressure + 0.35 * useful_gap_ratio)
+            effective_urgency = urgency / (
+                1.0 + self.travel_admission_lambda * normalized_distance)
+            state['travel_effective_urgency'] = float(effective_urgency)
+            state['travel_normalized_distance'] = float(normalized_distance)
+            if pool == 'service' and effective_urgency < self.travel_admission_gate:
+                pool = 'plus'
+
+        state['charging_pool_class'] = pool
+        state['charging_plus_threshold'] = float(plus_threshold)
+        return pool
+
+    def _admit_charging_node(self, node_id, emergency=False):
+        return self._charging_pool_class(node_id, emergency=emergency) is not None
+
+    def _ground_truth_charging_need(self, node_id, emergency=False):
+        node = self.network_nodes.get(node_id)
+        state = self.node_states.get(node_id)
+        if node is None or state is None or node_id == self.BS_ID:
+            return False
+        if node_id in self.fixed_charger_nodes or not self._base_charging_security_ok(node_id):
+            return False
+        e_max = max(
+            float(getattr(node, 'E_max', state.get('E_initial', 1.0))), 1e-12)
+        e_now = max(0.0, float(
+            getattr(node, 'E_current', state.get('E_est', e_max))))
+        ratio = e_now / e_max
+        q = self._effective_depletion_rate(node_id)
+        ttd = e_now / max(q, 1e-12) if q > 0.0 else 1e6
+        travel, _ = self._charger_travel_time_distance(node_id)
+        service_latency = self.estimate_service_latency_s(node_id)
+        critical_ratio = float(self.ablation.get(
+            'critical_energy_ratio', 0.15))
+        audit_margin = max(0.0, float(self.ablation.get(
+            'charging_need_audit_margin_s', 45.0)))
+        return bool(
+            emergency
+            or ratio <= critical_ratio
+            or ttd <= service_latency + audit_margin
+        )
+
+    def build_adaptive_charging_queue(self, idle_charger_count=None):
+        if not self.energy_experiment_active:
+            self.secure_charging_queue = []
+            self.secure_charging_node_ids = set()
+            self.service_charging_node_ids = set()
+            self.plus_charging_node_ids = set()
+            self.current_charging_clusters = {}
+            return []
+
+        service_ids = []
+        plus_ids = []
+        for nid in list(self.node_states.keys()):
+            if nid == self.BS_ID:
+                continue
+            emergency = nid in self.pending_sos_requests
+            pool = self._charging_pool_class(nid, emergency=emergency)
+            needed = self._ground_truth_charging_need(
+                nid, emergency=emergency)
+            admitted_service = pool == 'service'
+
+            state = self.node_states.get(nid, {})
+            cycle = int(state.get('charge_audit_cycle', 0))
+            audit_key = (int(nid), cycle, bool(needed), bool(admitted_service))
+            self.metrics.record_charging_decision(
+                needed=needed,
+                admitted=admitted_service,
+                decision_key=audit_key)
+
+            if pool == 'service':
+                service_ids.append(nid)
+            elif pool == 'plus':
+                plus_ids.append(nid)
+
+        if not service_ids:
+            self.secure_charging_queue = []
+            self.secure_charging_node_ids = set()
+            self.service_charging_node_ids = set()
+            self.plus_charging_node_ids = set()
+            self.current_charging_clusters = {}
+            try:
+                self.metrics.charging_kmeans_cluster_counts.append(0)
+                self.metrics.charging_cluster_assigned_node_counts.append(0)
+            except Exception:
+                pass
+            return []
+
+        def priority(nid):
+            return self.charging_dispatch_priority(nid)
+
+        max_queue = max(1, int(self.ablation.get(
+            'max_adaptive_charge_queue', 8)))
+        service_ids = sorted(set(service_ids), key=priority)[:max_queue]
+        plus_ids = sorted(set(plus_ids), key=priority)
+        self.service_charging_node_ids = set(service_ids)
+
+        for nid in service_ids:
+            state = self.node_states.get(nid, {})
+            cycle = int(state.get('charge_audit_cycle', 0))
+            if state.get('service_pool_counted_cycle') != cycle:
+                state['service_pool_counted_cycle'] = cycle
+                self.metrics.charging_service_pool_admissions += 1
+                if self.use_adaptive_quantum_charging:
+                    self.metrics.qifl_admission_count += 1
+
+        if self.use_rf_multi_node_charging:
+            clusters_obj = []
+            remaining_service = list(service_ids)
+            remaining_plus = list(plus_ids)
+            cluster_index = 0
+            max_members = max(1, int(self.ablation.get(
+                'max_rf_cluster_members', 5)))
+            max_plus = max(0, int(self.ablation.get(
+                'plus_pool_max_members_per_cluster', 2)))
+
+            def radius_feasible(nodes):
+                if not nodes:
+                    return False
+                cx = float(np.mean([node.x for node in nodes]))
+                cy = float(np.mean([node.y for node in nodes]))
+                radius = max(math.hypot(node.x - cx, node.y - cy)
+                             for node in nodes)
+                return radius <= self.rf_charging_radius + 1e-9
+
+            while remaining_service:
+                seed_id = remaining_service.pop(0)
+                members = [self.network_nodes[seed_id]]
+
+                while remaining_service and len(members) < max_members:
+                    cx = float(np.mean([node.x for node in members]))
+                    cy = float(np.mean([node.y for node in members]))
+                    ordered = sorted(
+                        remaining_service,
+                        key=lambda nid: math.hypot(
+                            self.network_nodes[nid].x - cx,
+                            self.network_nodes[nid].y - cy))
+                    selected = next((nid for nid in ordered if radius_feasible(
+                        members + [self.network_nodes[nid]])), None)
+                    if selected is None:
+                        break
+                    members.append(self.network_nodes[selected])
+                    remaining_service.remove(selected)
+
+                plus_added = 0
+                while (remaining_plus and len(members) < max_members and
+                       plus_added < max_plus):
+                    cx = float(np.mean([node.x for node in members]))
+                    cy = float(np.mean([node.y for node in members]))
+                    ordered = sorted(
+                        remaining_plus,
+                        key=lambda nid: math.hypot(
+                            self.network_nodes[nid].x - cx,
+                            self.network_nodes[nid].y - cy))
+                    selected = next((nid for nid in ordered if radius_feasible(
+                        members + [self.network_nodes[nid]])), None)
+                    if selected is None:
+                        break
+                    members.append(self.network_nodes[selected])
+                    remaining_plus.remove(selected)
+                    plus_added += 1
+
+                cluster = ChargingCluster.from_nodes(cluster_index, members)
+                clusters_obj.append(cluster)
+                cluster_index += 1
+
+            selected_ids = {
+                int(node.node_id)
+                for cluster in clusters_obj for node in cluster.nodes
+            }
+            selected_plus = selected_ids - set(service_ids)
+            self.plus_charging_node_ids = set(selected_plus)
+            self.secure_charging_node_ids = set(selected_ids)
+            self.secure_charging_queue = clusters_obj
+            self.current_charging_clusters = {
+                cluster.node_id: list(cluster.member_ids)
+                for cluster in clusters_obj}
+            try:
+                self.metrics.charging_kmeans_cluster_counts.append(
+                    float(len(clusters_obj)))
+                self.metrics.charging_cluster_assigned_node_counts.append(
+                    float(len(selected_ids)))
+                for nid in selected_plus:
+                    state = self.node_states.get(nid, {})
+                    cycle = int(state.get('charge_audit_cycle', 0))
+                    if state.get('plus_pool_counted_cycle') != cycle:
+                        state['plus_pool_counted_cycle'] = cycle
+                        self.metrics.charging_plus_pool_admissions += 1
+            except Exception:
+                pass
+            return self.secure_charging_queue
+
+        self.plus_charging_node_ids = set()
+        self.secure_charging_node_ids = set(service_ids)
+        self.secure_charging_queue = list(service_ids)
+        self.current_charging_clusters = {0: list(service_ids)}
+        try:
+            self.metrics.charging_kmeans_cluster_counts.append(1.0)
+            self.metrics.charging_cluster_assigned_node_counts.append(
+                float(len(service_ids)))
+            pass
+        except Exception:
+            pass
+        return self.secure_charging_queue
+
+    def validate_charging_request(self, node_id, emergency=False):
+        if not self.ablation.get('use_secure_charging_request_validation', True):
+            self.metrics.mc_raw_sos_dispatches += 1
+            ok = node_id in self.node_states and node_id != self.BS_ID
+        elif self.energy_experiment_active and (
+                self.use_adaptive_quantum_charging or
+                self.ablation.get('use_adaptive_charge_guards', False)):
+            if node_id in self.secure_charging_node_ids:
+                ok = self._base_charging_security_ok(node_id)
+            else:
+                ok = self._charging_pool_class(
+                    node_id, emergency=emergency) == 'service'
+        else:
+            ok = False
+            state = self.node_states.get(node_id)
+            if state is not None and node_id != self.BS_ID:
+                if state.get('status', 'WHITELISTED') not in ('BLACKLISTED', 'QUARANTINE') and not state.get('hard_veto', False):
+                    if float(state.get('Deviation_MC_norm', 0.0)) <= self.CHARGE_MAX_DEVIATION_MC_NORM and float(state.get('SED_index', 0.0)) < self.CHARGE_MAX_SED and float(state.get('spoof_trust', 1.0)) >= self.CHARGE_MIN_SPOOF_TRUST:
+                        E_initial = float(state.get('E_initial', 1.0))
+                        E_est = float(state.get('E_est', E_initial))
+                        E_claimed = float(state.get('E_claimed', E_est))
+                        max_claim_dev = float(getattr(self, 'CHARGE_MAX_CLAIM_EST_DEVIATION', self.ablation.get(
+                            'charge_claim_est_max_deviation', 0.30)))
+                        if abs(E_claimed - E_est) / max(E_initial, 1e-12) <= max_claim_dev:
+                            threshold = float(self.CHARGE_NEED_RATIO if not emergency else max(
+                                self.CHARGE_NEED_RATIO, 0.35))
+                            ok = (E_est / max(E_initial, 1e-12)) <= threshold
+
+            if not ok and self.energy_experiment_active and self.ablation.get('allow_energy_stress_predictive_charging', False):
+                state = self.node_states.get(node_id)
+                if state is not None and node_id != self.BS_ID:
+                    if state.get('status') not in ('BLACKLISTED', 'QUARANTINE') and not state.get('hard_veto', False):
+                        if float(state.get('Deviation_MC_norm', 0.0)) <= self.CHARGE_MAX_DEVIATION_MC_NORM and float(state.get('SED_index', 0.0)) < self.CHARGE_MAX_SED and float(state.get('spoof_trust', 1.0)) >= self.CHARGE_MIN_SPOOF_TRUST:
+                            E_initial = float(state.get('E_initial', 1.0))
+                            E_est = float(state.get('E_est', E_initial))
+                            ok = (E_est / max(E_initial, 1e-12)) <= float(
+                                self.ablation.get('charge_need_ratio', self.CHARGE_NEED_RATIO))
+
+        if emergency:
+            self.metrics.raw_sos_validation_attempts += 1
+            if not ok:
+                self.metrics.raw_sos_blocked += 1
+
+        if self.energy_experiment_active:
+            if node_id in self.pending_sos_requests or node_id in self.secure_charging_node_ids:
+                current_t = float(
+                    getattr(self.metrics, 'current_sim_time', 0.0))
+                self.metrics.record_charging_request(
+                    node_id, current_t, validated=ok)
+        return bool(ok)
+
+    def verify_charging_location(self, node_id, mc_x, mc_y, allowed_radius=None, charging_mode='contact', is_spoof_attempt=False):
+        self.metrics.mc_location_verification_checks += 1
+        if is_spoof_attempt:
+            self.metrics.mc_location_spoof_attempts += 1
+        state = self.node_states.get(node_id)
+        if state is None:
+            self.metrics.mc_location_verification_failures += 1
+            if is_spoof_attempt:
+                self.metrics.mc_location_spoof_detections += 1
+            return False
+        if not self.ablation.get('use_mc_location_verification', True):
+            state['spoof_trust'] = 1.0
+            self.metrics.mc_location_verification_passes += 1
+            if is_spoof_attempt:
+                self.metrics.mc_location_spoof_accepted += 1
+            return True
+
+        if allowed_radius is None:
+            allowed_radius = float(self.ablation.get(
+                'contact_location_tolerance_m', 5.0))
+        allowed_radius = max(0.0, float(allowed_radius))
+        distance = math.hypot(
+            float(mc_x) - float(state['x']),
+            float(mc_y) - float(state['y']))
+        valid = distance <= allowed_radius + 1e-9
+        state['spoof_trust'] = 1.0 if valid else 0.0
+        state['last_charging_mode'] = str(charging_mode)
+        state['last_charging_location_distance'] = float(distance)
+        state['last_charging_location_radius'] = float(allowed_radius)
+        if valid:
+            self.metrics.mc_location_verification_passes += 1
+            if is_spoof_attempt:
+                self.metrics.mc_location_spoof_accepted += 1
+        else:
+            self.metrics.mc_location_verification_failures += 1
+            if is_spoof_attempt:
+                self.metrics.mc_location_spoof_detections += 1
+        return valid
 
     def _credit_accepted_mc_injection(self, node_id, injected_energy, timestamp=None):
         state = self.node_states.get(node_id)
@@ -1686,14 +2424,12 @@ class BaseStation:
         now = self._now() if timestamp is None else float(timestamp)
         current_injected = state.get('total_injected_energy', 0.0)
         state['total_injected_energy'] = current_injected + injected_energy
+        state['energy_injected_since_physical_sample'] = float(
+            state.get('energy_injected_since_physical_sample', 0.0)) + injected_energy
         self.mc_recent_injected_energy[node_id] += injected_energy
         E0 = float(state.get('E_initial', 1.0))
         new_est = min(E0, float(state.get('E_est', 0.0)) + injected_energy)
         state['E_est'] = new_est
-        # In adaptive charging modes, accepted MC OOB reports are authenticated
-        # evidence of energy delivery.  Crediting the service ledger prevents
-        # false charge-hoarding alarms before the next piggyback packet.  The
-        # legacy/no-QIFL-DQN scenario is left unchanged for fair comparison.
         adaptive_credit = bool(self.use_adaptive_quantum_charging or
                                self.ablation.get('use_adaptive_charge_guards', False) or
                                self.ablation.get('use_dqn_charger_routing', False))
@@ -1709,14 +2445,43 @@ class BaseStation:
         previous = self.last_charge_time_by_node[node_id]
         if math.isfinite(previous) and now >= previous:
             try:
-                self.metrics.mc_revisit_intervals.append(
-                    max(0.0, now - previous))
-                self.metrics.mc_repeated_service_events += 1
+                interval = max(0.0, now - previous)
+                self.metrics.mc_total_revisit_events += 1
+                self.metrics.mc_revisit_intervals.append(interval)
+                if interval < max(0.0, float(self.charging_reentry_cooldown_s)):
+                    self.metrics.mc_repeated_service_events += 1
             except Exception:
                 pass
         self.last_charge_time_by_node[node_id] = now
+        state['charge_audit_cycle'] = int(
+            state.get('charge_audit_cycle', 0)) + 1
         self.last_charged_energy_ratio_by_node[node_id] = new_est / max(
             E0, 1e-12)
+
+    def is_deadline_rescue_node(self, node_id, current_time=None):
+        """
+        Checks if a node is critically low on energy and requires immediate emergency rescue
+        before its hard deadline.
+        """
+        state = self.node_states.get(node_id)
+        if not state:
+            return False
+
+        now = self._now() if current_time is None else float(current_time)
+        e_est = self._estimate_energy_now(node_id, now)
+        e_initial = max(float(state.get('E_initial', 1.0)), 1e-12)
+        q = self._effective_depletion_rate(node_id, now)
+
+        # Time To Death (TTD)
+        ttd = e_est / max(q, 1e-12) if q > 0 else float('inf')
+
+        hard_margin = float(self.ablation.get('hard_deadline_margin_s', 90.0))
+        critical_ratio = float(self.ablation.get(
+            'critical_energy_ratio', 0.15))
+
+        # A node needs rescue if its remaining time is less than the safety margin
+        # OR its energy ratio has dropped below the critical threshold.
+        return bool(ttd <= hard_margin or (e_est / e_initial) <= critical_ratio)
 
     def report_mc_injection_oob(self, node_id, injected_energy, mc_x=None, mc_y=None, mac_tag=None, mc_id=None, counter=None, nonce=None, timestamp=None):
         auth_enabled = self.ablation.get('use_mc_hmac_authentication', True)
@@ -1803,98 +2568,3 @@ class BaseStation:
                 state['wake_up_token'] = token
                 self.metrics.update_packet_transmission(
                     is_critical=True, is_control=True, size_bytes=16)
-
-    def _verify_stealthy_attackers(self):
-        if not self.ablation.get('use_stealthy_attacker_detection', True):
-            return
-        kappa = 5.0
-        VETO_THRESHOLD = 0.4
-        for nid, state in self.node_states.items():
-            if nid == self.BS_ID or state.get('status') == 'BLACKLISTED':
-                continue
-            T2 = state.get('T2_history', 1.0)
-            E_est = state.get('E_est', state['E_initial'])
-            E_claimed = state.get('E_claimed', state['E_initial'])
-            E_max = state['E_initial']
-            drop_rate = 1.0 - T2
-            energy_diff = max(0.0, E_est - E_claimed)
-            alibi_penalty = 1.0 - math.exp(-kappa * (energy_diff / E_max))
-            S_stealth = drop_rate * alibi_penalty
-            state['S_stealth'] = S_stealth
-            if S_stealth >= VETO_THRESHOLD:
-                print(
-                    f"[WRSN SECURITY] Stealthy Attacker CAUGHT! Node {nid} used Battery Alibi. S_stealth={S_stealth:.3f}")
-                state['hard_veto'] = True
-                state['status'] = 'BLACKLISTED'
-                state['FE'] = 0.0
-
-    def _verify_trajectory_manipulators(self):
-        if not self.ablation.get('use_sed_filter', self.ablation.get('use_zero_overhead_spoof_detection', True)):
-            return
-        bs_x, bs_y = self.network_nodes[self.BS_ID].x, self.network_nodes[self.BS_ID].y
-        non_bs_states = [state for nid,
-                         state in self.node_states.items() if nid != self.BS_ID]
-        if not non_bs_states:
-            return
-        D_max = max(math.hypot(state['x'] - bs_x, state['y'] - bs_y)
-                    for state in non_bs_states)
-        D_max = max(D_max, 1e-6)
-        epsilon = 1e-6
-
-        for nid, state in self.node_states.items():
-            if nid == self.BS_ID:
-                continue
-            e_prev = state.get('E_claimed_prev_SED', state['E_initial'])
-            e_curr = state.get('E_claimed', state['E_initial'])
-            state['delta_E'] = max(0.0, e_prev - e_curr)
-            state['E_claimed_prev_SED'] = e_curr
-
-        for nid in list(self.pending_sos_requests):
-            state = self.node_states.get(nid)
-            if not state or state.get('status') == 'BLACKLISTED':
-                self.pending_sos_requests.discard(nid)
-                continue
-
-            delta_E_i = state.get('delta_E', 0.0)
-            neighbors_delta_e = []
-            for other_nid, other_state in self.node_states.items():
-                if other_nid != nid and other_nid != self.BS_ID:
-                    dist = math.hypot(
-                        state['x'] - other_state['x'], state['y'] - other_state['y'])
-                    if dist <= 30.0:
-                        neighbors_delta_e.append(
-                            other_state.get('delta_E', 0.0))
-
-            if len(neighbors_delta_e) > 0:
-                mu_delta_e = float(np.mean(neighbors_delta_e))
-                sigma_delta_e = float(np.std(neighbors_delta_e))
-            else:
-                mu_delta_e = 0.0
-                sigma_delta_e = 0.0
-
-            D_BS_i = math.hypot(state['x'] - bs_x, state['y'] - bs_y)
-            z_score = abs(delta_E_i - mu_delta_e) / (sigma_delta_e + epsilon)
-            distance_penalty = 1.0 + (D_BS_i / D_max)
-            SED_index = z_score * distance_penalty
-            state['SED_index'] = SED_index
-
-            if SED_index >= 3.0:
-                print(
-                    f"[WRSN SECURITY] Trajectory Manipulator CAUGHT! Node {nid} SED={SED_index:.2f}. Fake SOS Dropped.")
-                state['hard_veto'] = True
-                state['status'] = 'BLACKLISTED'
-                state['FE'] = 0.0
-                self.pending_sos_requests.discard(nid)
-
-    def get_blacklisted_nodes(self):
-        return [nid for nid, state in self.node_states.items() if state.get('status') == 'BLACKLISTED']
-
-    def get_adaptive_threshold_for_node(self, node_id):
-        if not self.ablation.get('use_adaptive_edge_threshold', True):
-            return self.default_threshold
-        history = self.environmental_history.get(node_id, [])
-        if len(history) < 5:
-            return self.default_threshold
-        mu = float(np.mean(history))
-        sigma = float(np.std(history))
-        return mu + self.threshold_k * sigma

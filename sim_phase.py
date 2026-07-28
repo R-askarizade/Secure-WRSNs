@@ -46,17 +46,69 @@ def _base_config():
         'use_mc_hmac_authentication': True,
         'use_mc_location_verification': True,
         'use_secure_charging_request_validation': True,
+
+        # Adaptive charging core features
         'use_adaptive_quantum_charging': False,
         'use_dqn_charger_routing': False,
         'enable_qifl_learning': True,
+
+        # ---------------------------------------------------------
+        # NEW: Multi-Node RF Charging & Dynamic Partial Allocation
+        # ---------------------------------------------------------
+        'use_hybrid_fixed_chargers': False,
+        'use_rf_multi_node_charging': False,
+        'rf_charging_radius': 25.0,
+        'use_dynamic_partial_charging': False,
+        'dynamic_charging_weight_wt': 1.0,
+        'dynamic_charging_weight_eps': 1.0,
+        'dynamic_charging_weight_now': 1.0,
+        'charging_rate': 5.0,
+        'rf_path_loss_exponent': 2.0,
+        'rf_reference_distance_m': 1.0,
+        'rf_energy_conversion_efficiency': 0.70,
+        'contact_location_tolerance_m': 5.0,
+        'fixed_charger_count': 1,
+        'fixed_charger_trigger_ratio': 0.15,
+        'fixed_charger_target_ratio': 0.88,
+        # ---------------------------------------------------------
+
+        # ---------------------------------------------------------
+        # NEW: Hybrid Hierarchical Routing & Clustering Parameters
+        # ---------------------------------------------------------
+        # The original routing engine remains the reference plane for
+        # control and all charging decisions.  Only DATA packets use the new
+        # clustered/MST overlay below.
+        'use_hybrid_hierarchical_routing': True,
+        'use_data_plane_hybrid_routing': True,
+        'use_adaptive_greedy_weights': True,
+        'use_ifbe_fuzzy_ch_selection': True,
+        'use_fcbe_soft_balancing': True,
+        'use_mst_backbone': True,
+
+        # Strict energy-dominance guards: a DATA route may replace the original
+        # route only when projected radio energy and bottleneck stress do not
+        # increase.  These are routing parameters, not charger parameters.
+        'data_route_recompute_period': 5,
+        'data_route_energy_tolerance': 0.0,
+        'data_route_stress_tolerance': 0.0,
+        'data_route_distance_stretch': 1.0,
+        'data_route_hop_slack': 0,
+        'data_route_min_improvement': 0.0025,
+        'data_secondary_k_paths': 24,
+        'data_secondary_max_energy_stretch': 1.0,
+        # ---------------------------------------------------------
+
         'energy_ewma_beta': 0.70,
         'qifl_learning_rate': 5e-3,
         'dqn_learning_rate': 1e-3,
         'dqn_max_candidates': 12,
+        'dqn_epsilon': None,
+        'dqn_exploration_mode': 'uncertainty_adaptive',
+        'dqn_warmup_updates': 32,
+        'dqn_warmup_competitive_decisions': 24,
         'use_gpu_for_adaptive_charging': True,
         'sos_threshold_margin_ratio': 0.03,
 
-        # Efficiency guards for the adaptive charging framework.
         'use_charging_hysteresis': True,
         'minimum_charge_energy_ratio': 0.08,
         'post_charge_release_ratio': 0.88,
@@ -66,15 +118,34 @@ def _base_config():
         'qifl_sos_threshold_upper_bound': 0.90,
         'minimum_cluster_charge_gap_ratio': 0.05,
         'penalize_repeated_mc_visits': True,
-        'dqn_reward_travel_weight': 1.0,
-        'dqn_reward_energy_weight': 1.0,
-        'dqn_reward_deadline_weight': 2.0,
+        'dqn_reward_travel_weight': 0.75,
+        'dqn_reward_energy_weight': 1.5,
+        'dqn_reward_deadline_weight': 4.0,
         'dqn_reward_revisit_penalty': 2.0,
+        'dqn_reward_death_penalty': 6.0,
         'use_travel_aware_admission': True,
         'travel_admission_lambda': 2.0,
         'travel_admission_gate': 0.10,
         'hard_deadline_margin_s': 90.0,
+        'service_cycle_fallback_s': 225.0,
+        'service_horizon_safety_multiplier': 1.12,
+        'balanced_service_horizon_cap_s': 420.0,
+        'emergency_service_horizon_cap_s': 720.0,
+        'opportunistic_plus_horizon_s': 150.0,
+        'plus_pool_target_ratio': 0.45,
+        'plus_pool_max_members_per_cluster': 2,
+        'max_rf_cluster_members': 5,
+        'max_cluster_stay_time_s': 1.50,
+        'adaptive_request_threshold_hard_cap': 0.68,
+        'request_plus_fraction': 0.50,
+        'max_service_latency_batches': 6,
+        'depletion_rate_safety_factor': 1.20,
+        'physical_eps_ewma_beta': 0.70,
+        'communication_energy_reserve_ratio': 0.04,
+        'service_latency_safety_margin_s': 75.0,
         'use_deadline_safe_energy_sentinel': True,
+        'use_universal_mc_feasibility_guard': True,
+        'mc_reserve_ratio': 0.05,
 
         'mobile_charger_selection_mode': 'hardcoded',
         'num_mobile_chargers': 1,
@@ -119,13 +190,134 @@ def _scenarios_for_mode(mode):
     aliases = {
         'physical': 'physical_compromise', 'tpm': 'physical_compromise', 'tpm_compromise': 'physical_compromise',
         'mc': 'charging_suite', 'mobile_charging': 'charging_suite', 'charging': 'charging_suite',
+        'routing': 'routing_suite', 'routing_ablation': 'routing_suite', 'cluster': 'routing_suite',
         'all': 'all_modes', 'full': 'all_modes', 'full_suite': 'all_modes', 'everything': 'all_modes',
         'complete': 'all_modes', 'complete_suite': 'all_modes',
         'sweep': 'parameter_sweep', 'stress': 'parameter_sweep', 'parameter': 'parameter_sweep',
+        'article': 'article_scaled', 'paper_energy': 'article_scaled',
+        'article_energy': 'article_scaled', 'article_mc': 'article_scaled',
+        'paper_mc': 'article_scaled', 'article_compare': 'article_scaled',
+        'article_energy_mc_sweep': 'article_scaled',
+        'article_energy_comparison': 'article_scaled',
     }
     mode = aliases.get(mode, mode)
 
     base = _base_config()
+
+    def get_article_scaled_single():
+        """One runtime-scaled article profile built on the best V5 energy method.
+
+        The physical paper horizon is 5000 x 30 = 150000 s.  To avoid an
+        impractically long event-driven run, the default effective horizon is
+        3600 s.  Stored battery energies are scaled by the same time ratio,
+        while per-packet radio coefficients, charging power, movement cost,
+        radius, and speed retain their paper values.  This preserves the main
+        horizon-normalized energy ratios for a stationary workload without
+        changing packet/header sizes or any charging-request threshold.
+        """
+        # Start from the exact V5 EnergyStress method so QIFL/DQN, request
+        # thresholds, packet/header sizes, routing, and charger count remain
+        # unchanged unless explicitly listed below.
+        _, reference = get_energy()[0]
+        c = dict(reference)
+
+        physical_time_s = 5000.0 * 30.0
+        effective_time_s = float(os.environ.get(
+            'WRSN_ARTICLE_SCALED_TIME', 3600.0))
+        effective_time_s = min(physical_time_s, max(30.0, effective_time_s))
+        time_scale = effective_time_s / physical_time_s
+
+        physical_sensor_energy_j = 5.0
+        physical_mc_capacity_j = 200000.0
+        effective_sensor_energy_j = physical_sensor_energy_j * time_scale
+        effective_mc_capacity_j = physical_mc_capacity_j * time_scale
+        charger_count = max(1, int(c.get('num_mobile_chargers', 1)))
+
+        c.update({
+            'article_energy_profile_enabled': True,
+            'article_scaled_single_scenario': True,
+            'article_physical_simulation_time_s': physical_time_s,
+            'article_effective_simulation_time_s': effective_time_s,
+            'article_time_scale': time_scale,
+            'article_physical_sensor_initial_energy_j': physical_sensor_energy_j,
+            'article_physical_mc_capacity_per_charger_j': physical_mc_capacity_j,
+
+            # Time-scaled stored energies.  The ratio MC_capacity/E0 remains
+            # exactly 200000/5 = 40000, and the shortened horizon has the same
+            # ratio to both stored-energy values.
+            'initial_energy_override': effective_sensor_energy_j,
+            'mobile_charger_capacity_mode': 'absolute',
+            'mobile_charger_capacity': effective_mc_capacity_j,
+            'mobile_charger_capacities': [effective_mc_capacity_j] * charger_count,
+
+            # Exact article radio coefficients; packet/header sizes are NOT
+            # overridden and therefore remain those of the original method.
+            'radio_e_elec_j_per_bit': 50e-9,
+            'radio_eps_fs_j_per_bit_m2': 100e-12,
+            'radio_eps_mp_j_per_bit_m4': 0.013e-12,
+
+            # Exact requested MC physical parameters.  Capacity remains in
+            # ABSOLUTE mode; relative mode can still be selected later by the
+            # original resolver without any special-case code.
+            'mobile_charger_travel_cost_mode': 'absolute',
+            'mobile_charger_travel_energy_cost_per_m': 0.010,
+            'mobile_charger_travel_energy_costs_per_m': [0.010] * charger_count,
+            'charging_rate': 0.005,
+            'rf_charging_radius': 5.0,
+            'mobile_charger_speed': 5.0,
+            'mobile_charger_speeds': [5.0] * charger_count,
+
+            # One scaled scenario only.
+            'simulation_time_override_s': effective_time_s,
+        })
+        return [('Article_Scaled_Absolute_Single', c)]
+
+    def get_routing_ablation():
+        out = []
+
+        guarded_defaults = {
+            'experiment_family': 'routing_clustering_ablation',
+            'enable_energy_experiment': True,
+
+            # Active New Routing Features
+            'use_hybrid_hierarchical_routing': True,
+            'use_data_plane_hybrid_routing': True,
+            'use_adaptive_greedy_weights': True,
+            'use_ifbe_fuzzy_ch_selection': True,
+            'use_fcbe_soft_balancing': True,
+            'use_mst_backbone': True,
+        }
+
+        def add(name, **changes):
+            c = dict(base)
+            c.update(guarded_defaults)
+            c.update(changes)
+            out.append((name, c))
+
+        # 1. Master Method with all layers enabled
+        add('Final_Method_MC_Completed', **{})
+
+        # 2. Isolate Soft Balancing (Phase 2 FCBE)
+        add('Routing_No_FCBE_SoftBalancing',
+            use_fcbe_soft_balancing=False)
+
+        # 3. Isolate Fuzzy CH Selection (Phase 1 IFBE)
+        add('Routing_No_IFBE_Selection',
+            use_ifbe_fuzzy_ch_selection=False)
+
+        # 4. Isolate Adaptive Urgency Weights
+        add('Routing_No_AdaptiveWeights',
+            use_adaptive_greedy_weights=False)
+
+        # 5. Isolate the DATA-plane MST backbone.
+        add('Routing_No_MST_Backbone',
+            use_mst_backbone=False)
+
+        # 6. Reference method: no DATA-plane overlay.
+        add('Routing_Flat_Baseline',
+            use_data_plane_hybrid_routing=False)
+
+        return out
 
     def get_energy():
         c = dict(base)
@@ -140,8 +332,21 @@ def _scenarios_for_mode(mode):
             'allow_energy_stress_predictive_charging': True,
             'use_adaptive_quantum_charging': True,
             'use_dqn_charger_routing': True,
+
+            'use_hybrid_fixed_chargers': True,
+            'use_rf_multi_node_charging': True,
+            'use_dynamic_partial_charging': True,
+
             'use_charging_hysteresis': True,
             'use_adaptive_charge_guards': True,
+            'mobile_charger_capacity_mode': 'absolute',
+            'mobile_charger_capacity': 50000.0,
+            'mobile_charger_capacities': [50000.0],
+            'mobile_charger_travel_cost_mode': 'absolute',
+            'mobile_charger_travel_energy_cost_per_m': 0.1,
+            'mobile_charger_speed': 5.0,
+            'mobile_charger_speeds': [5.0],
+            'charging_rate': 5.0,
             'minimum_charge_energy_ratio': 0.08,
             'post_charge_release_ratio': 0.88,
             'charging_reentry_cooldown_s': 180.0,
@@ -172,6 +377,10 @@ def _scenarios_for_mode(mode):
             'qifl_sos_threshold_upper_bound': 0.90,
             'minimum_cluster_charge_gap_ratio': 0.05,
             'penalize_repeated_mc_visits': True,
+
+            'use_hybrid_fixed_chargers': True,
+            'use_rf_multi_node_charging': True,
+            'use_dynamic_partial_charging': True,
         }
 
         def add(name, **changes):
@@ -180,12 +389,10 @@ def _scenarios_for_mode(mode):
             c.update(changes)
             out.append((name, c))
 
-        # Main proposed method after efficiency guards.
         add('MC_Full_QIFL_DQN',
             use_adaptive_quantum_charging=True,
             use_dqn_charger_routing=True)
 
-        # Backward-compatible name used by your previous tables.
         add('MC_Full_Security',
             use_adaptive_quantum_charging=True,
             use_dqn_charger_routing=True)
@@ -235,7 +442,21 @@ def _scenarios_for_mode(mode):
                     use_relative_mc_feasibility_guard=True,
                     max_adaptive_charge_queue=max(18, mc_count * 5))
 
-        # Isolate the contribution of each new module.
+        add('MC_No_Fixed_Chargers',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_hybrid_fixed_chargers=False)
+
+        add('MC_No_RF_MultiNode',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_rf_multi_node_charging=False)
+
+        add('MC_No_Dynamic_Partial',
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            use_dynamic_partial_charging=False)
+
         add('MC_QIFL_Only',
             use_adaptive_quantum_charging=True,
             use_dqn_charger_routing=False)
@@ -245,9 +466,10 @@ def _scenarios_for_mode(mode):
         add('MC_No_QIFL_DQN',
             use_adaptive_quantum_charging=False,
             use_dqn_charger_routing=False,
-            use_adaptive_charge_guards=False)
+            use_adaptive_charge_guards=False,
+            use_rf_multi_node_charging=False,
+            use_dynamic_partial_charging=False)
 
-        # Guard ablation: proves whether hysteresis/cooldown/minimum charge solve
         add('MC_QIFL_DQN_No_Guards',
             use_adaptive_quantum_charging=True,
             use_dqn_charger_routing=True,
@@ -333,14 +555,18 @@ def _scenarios_for_mode(mode):
             add(f'Sweep_WindowW_{w}', sliding_window_size=w)
         return out
 
+    if mode == 'article_scaled':
+        return get_article_scaled_single()
     if mode == 'physical_compromise':
         return _physical_compromise_scenarios()
     if mode == 'security_suite':
         return [('Phase1_Method', base)] + get_ablation()
     if mode in ('charging_suite', 'energy_suite', 'mc_suite', 'charging_ablation'):
         return get_energy() + get_mc_ablation()
+    if mode == 'routing_suite':
+        return get_routing_ablation()
     if mode == 'all_modes':
-        return [('Phase1_Method', base)] + get_ablation() + get_energy() + get_mc_ablation() + _physical_compromise_scenarios()
+        return [('Phase1_Method', base)] + get_ablation() + get_energy() + get_mc_ablation() + get_routing_ablation() + _physical_compromise_scenarios()
     if mode in ('parameter_sweep', 'stress_sweep', 'innovation_parameter_sweep'):
         return get_parameter_sweep()
     if mode == 'energy':
@@ -358,6 +584,9 @@ def _edgecase_base_station(async_pipeline=False):
     cfg['use_asynchronous_processing_pipeline'] = bool(async_pipeline)
     cfg['require_source_packet_hmac'] = True
     cfg['use_critical_multipath_routing'] = True
+    # Ensure edge case mocks use flat routing compatibility if testing raw paths
+    cfg['use_hybrid_hierarchical_routing'] = False
+    cfg['use_data_plane_hybrid_routing'] = False
     metrics = MetricsCollector(total_nodes=4, total_rounds_or_time=10)
     bs = BaseStation(metrics, cfg, bs_id=0)
 
@@ -651,7 +880,8 @@ def run_innovation_coverage_validation(output_csv='phase1_innovation_coverage_va
         1, 0.2, mc_x=0.0, mc_y=0.0, mac_tag=good_tag, mc_id='MC-1', counter=2, nonce='n-good', timestamp=2.0)
     replay = bs.report_mc_injection_oob(
         1, 0.2, mc_x=0.0, mc_y=0.0, mac_tag=good_tag, mc_id='MC-1', counter=2, nonce='n-good', timestamp=2.0)
-    bs.verify_charging_location(1, mc_x=999.0, mc_y=999.0)
+    bs.verify_charging_location(
+        1, mc_x=999.0, mc_y=999.0, is_spoof_attempt=True)
     bs.node_states[1]['E_est'] = 0.2
     bs.node_states[1]['E_claimed'] = 0.9
     raw_ok = bs.validate_charging_request(1, emergency=True)
@@ -723,7 +953,6 @@ def run_self_tests(verbose=True):
     metrics = MetricsCollector(total_nodes=4, total_rounds_or_time=10)
     bs = BaseStation(metrics, cfg, bs_id=0)
 
-    # Initialize standard test node
     bs.node_states[1] = {
         'x': 0.0, 'y': 0.0, 'E_initial': 1.0, 'E_claimed': 1.0, 'E_est': 0.2, 'trust_vector': [1, 1, 1, 1, 1],
         'T1_history': 1.0, 'T2_history': 1.0, 'T3_history': 1.0, 'T4_history': 1.0, 'T5_history': 1.0,
@@ -859,12 +1088,13 @@ def _add_charging_efficiency_diagnostics(df):
 
 def run_statistical_experiments():
     run_mode = os.environ.get(
-        'WRSN_RUN_MODE', 'charging_suite').strip().lower().replace('-', '_')
+        'WRSN_RUN_MODE', 'energy').strip().lower().replace('-', '_')
     aliases = {
         'edge_cases': 'security_edge_cases', 'edge_validation': 'security_edge_cases',
         'security_validation': 'security_edge_cases', 'security_edge_validation': 'security_edge_cases',
         'innovation': 'innovation_coverage', 'innovation_audit': 'innovation_coverage',
         'phase1_innovation_audit': 'innovation_coverage', 'innovation_validation': 'innovation_coverage',
+        'routing': 'routing_suite', 'clustering': 'routing_suite', 'routing_ablation': 'routing_suite'
     }
     normalized_mode = aliases.get(run_mode, run_mode)
 
@@ -875,7 +1105,9 @@ def run_statistical_experiments():
 
     NUM_SEEDS = int(os.environ.get('WRSN_NUM_SEEDS', 1))
     NUM_NODES = int(os.environ.get('WRSN_NUM_NODES', 100))
-    SIM_TIME = int(os.environ.get('WRSN_SIM_TIME', 3600))
+    sim_time_env = os.environ.get('WRSN_SIM_TIME')
+    SIM_TIME = int(sim_time_env) if sim_time_env is not None else 3600
+
     scenarios = _scenarios_for_mode(normalized_mode)
     scenario_names = [name for name, _ in scenarios]
     safe_mode = ''.join(c if c.isalnum() or c in ('_', '-')
@@ -887,38 +1119,37 @@ def run_statistical_experiments():
 
     all_results = []
     for scenario_name, config in scenarios:
+        scenario_sim_time = (
+            SIM_TIME if sim_time_env is not None else
+            int(float(config.get('simulation_time_override_s', SIM_TIME)))
+        )
         for seed in range(1, NUM_SEEDS + 1):
-            print(f"\n--- {scenario_name}: Seed {seed}/{NUM_SEEDS} ---")
+            print(f"\n--- {scenario_name}: Seed {seed}/{NUM_SEEDS}; "
+                  f"sim_time={scenario_sim_time}s ---")
             sim = SimulatorManager(
-                num_nodes=NUM_NODES, sim_time=SIM_TIME, ablation_config=config, seed=seed)
+                num_nodes=NUM_NODES, sim_time=scenario_sim_time,
+                ablation_config=config, seed=seed)
             sim.run_simulation()
             all_results.append(sim.metrics.export_summary(
-                seed, scenario_name, SIM_TIME))
+                seed, scenario_name, scenario_sim_time))
 
     df = pd.DataFrame(all_results)
     df = _add_charging_efficiency_diagnostics(df)
-    prefix = f"security_performance_{safe_mode}"
+    prefix = f"performance_{safe_mode}"
     df.to_csv(f'{prefix}_results.csv', index=False)
     summary = summarize_results(df, f'{prefix}_summary_ci.csv')
     make_plots(df, f'plots_{prefix}')
     print(
         f"\n[SUCCESS] Saved {prefix}_results.csv, {prefix}_summary_ci.csv, and plots_{prefix}/")
 
-    keep = [c for c in ['Ablation_Scenario', 'N', 'TPR_Mean', 'FPR_Mean', 'Accuracy_Mean', 'F1_Score_Mean',
+    keep = [c for c in ['Ablation_Scenario', 'N', 'TPR_Mean', 'Accuracy_Mean', 'F1_Score_Mean',
                         'Overall_PDR_Mean', 'Critical_PDR_Mean', 'Throughput_Mean', 'Avg_Delay_Mean',
                         'Operational_Control_Overhead_%_Mean', 'Mobile_Charger_Count_Mean',
-                        'Sensor_Initial_Energy_Mean', 'Mobile_Charger_Total_Capacity_Mean',
-                        'Mobile_Charger_Total_Sensor_Equivalent_Capacity_Mean',
-                        'Mobile_Charger_Avg_Travel_Energy_Cost_Per_M_Mean', 'MC_Travel_Distance_Mean',
-                        'MC_Injected_Energy_Per_Charge_Event_Mean', 'MC_Travel_Per_Charged_Joule_Mean',
+                        'MC_Travel_Distance_Mean', 'MC_Injected_Energy_Per_Charge_Event_Mean',
                         'MC_Charge_Events_Per_Critical_Node_Mean', 'MC_Deadline_Failure_Rate_Mean',
-                        'Energy_Critical_Death_Rate_Mean', 'MC_Useless_Charge_Rate_Heuristic_Mean',
-                        'QIFL_Learning_Active_Flag_Mean', 'DQN_Learning_Active_Flag_Mean',
-                        'Charging_Decision_Accuracy_Mean', 'Silent_Node_Rescue_Rate_Mean',
-                        'Delay_Attribution_Accuracy_Mean', 'Tomography_Observability_Ratio_Mean',
-                        'Shadow_Route_Hit_Rate_Mean', 'Critical_Secondary_Path_Availability_Rate_Mean',
-                        'Forged_MC_Report_Rejection_Rate_Mean', 'Charge_Hoarder_Detection_Rate_Mean',
-                        'MC_TPM_Compromise_Events_Mean', 'MC_TPM_Zeroized_Events_Mean'] if c in summary.columns]
+                        'Energy_Critical_Death_Rate_Mean', 'FND_Mean', 'HND_Mean', 'LND_Mean',
+                        'Adaptive_K_opt_Avg_Mean', 'Shadow_Route_Hit_Rate_Mean',
+                        'Critical_Secondary_Path_Availability_Rate_Mean'] if c in summary.columns]
     print(summary[keep].to_string(index=False))
 
     all_mode_aliases = {'all', 'all_modes', 'full',

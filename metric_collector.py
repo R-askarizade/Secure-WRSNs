@@ -31,8 +31,13 @@ class MetricsCollector:
         self.control_packets = 0
         self.alive_nodes = total_nodes
         self.node_death_times = {}
+        self._currently_dead_nodes = set()
         self.network_residual_energy_history = []
         self.mc_travel_distance = 0.0
+        self.mc_travel_energy = 0.0
+        self.mc_rf_transmit_energy = 0.0
+        self.mc_contact_charging_energy = 0.0
+        self.rf_total_delivered_energy = 0.0
 
         self.fuzzy_objective_values = []
         self.fuzzy_silhouette_scores = []
@@ -55,11 +60,17 @@ class MetricsCollector:
         self.energy_critical_node_deaths = 0
         self._critical_nodes_seen = set()
         self._charging_request_first_seen_time = {}
+        self._active_charging_requests = set()
+        self._rejected_charging_request_keys = set()
 
         self.mc_fake_reports_attempted = 0
         self.mc_fake_reports_accepted = 0
+        self.mc_location_verification_checks = 0
+        self.mc_location_verification_passes = 0
+        self.mc_location_verification_failures = 0
         self.mc_location_spoof_attempts = 0
         self.mc_location_spoof_accepted = 0
+        self.mc_location_spoof_detections = 0
         self.mc_raw_sos_dispatches = 0
         self.mc_rejected_unauth_reports = 0
         self.mc_tpm_compromise_events = 0
@@ -73,6 +84,7 @@ class MetricsCollector:
         self.charging_decision_fp = 0
         self.charging_decision_tn = 0
         self.charging_decision_fn = 0
+        self._charging_decision_keys = set()
         self.silent_node_sos_count = 0
         self.silent_node_rescue_count = 0
         self.false_sos_count = 0
@@ -123,6 +135,7 @@ class MetricsCollector:
         self.dqn_reward_deadline_components = []
         self.dqn_reward_travel_components = []
         self.dqn_reward_revisit_components = []
+        self.dqn_reward_death_components = []
         self.adaptive_hyperparameters = {}
         self.dynamic_trust_weights_history = []
         self.mc_service_durations = []
@@ -142,13 +155,49 @@ class MetricsCollector:
         self.qifl_admission_count = 0
 
         # THREE-VERSION ENERGY-STRESS ABLATION METRICS
-        # These counters isolate only the behavioral differences between V1,
-        # V2, and the final V3 policy.
         self.qifl_min_gap_conflict_rejections = 0
         self.qifl_min_gap_conflict_preserved = 0
         self.verified_emergency_security_override_count = 0
 
-    def update_packet_transmission(self, is_critical, is_control, size_bytes, is_delivered=False, delay=None, overhead_phase='operational', count_generated=True):
+        # Multi-Node RF Charging & Dynamic Partial Allocation Metrics
+        self.rf_cluster_charge_events = 0
+        self.rf_total_nodes_charged_in_clusters = 0
+        self.dynamic_partial_charge_events = 0
+        self.fixed_charger_charge_events = 0
+        self.fixed_charger_total_injected_energy = 0.0
+        self.fixed_charger_active_nodes = 0
+        self.mc_infeasible_mission_rejections = 0
+        self.mc_stranded_events = 0
+        self.mc_async_missions_started = 0
+        self.mc_async_missions_completed = 0
+        self.mc_async_missions_incomplete = 0
+        self.mc_network_events_while_busy = 0
+        self.charging_service_pool_admissions = 0
+        self.charging_plus_pool_admissions = 0
+        self.charging_opportunistic_plus_charges = 0
+
+        # [INNOVATION] Hybrid Hierarchical Routing & Fuzzy Clustering Metrics
+        self.adaptive_k_opts = []
+
+        # DATA-only routing overlay diagnostics.  These metrics are separated
+        # from all mobile-charging metrics.
+        self.data_routing_diagnostics_history = []
+
+    def record_data_routing_diagnostics(self, diagnostics):
+        if not diagnostics:
+            return
+        clean = {}
+        for key, value in dict(diagnostics).items():
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                clean[str(key)] = number
+        if clean:
+            self.data_routing_diagnostics_history.append(clean)
+
+    def update_packet_transmission(self, is_critical, is_control, size_bytes, is_delivered=False, delay=None, overhead_phase='operational', count_generated=True, size_bits=None):
         if is_control:
             if overhead_phase == 'setup':
                 self.setup_control_packets += 1
@@ -163,7 +212,9 @@ class MetricsCollector:
                     self.generated_critical_packets += 1
             if is_delivered:
                 self.received_data_packets += 1
-                self.total_bits_received += (size_bytes * 8)
+                bit_count = float(size_bytes) * \
+                    8.0 if size_bits is None else float(size_bits)
+                self.total_bits_received += bit_count
                 if is_critical:
                     self.received_critical_packets += 1
                 if delay is not None:
@@ -176,24 +227,54 @@ class MetricsCollector:
         self.fn += fn_increment
 
     def record_node_death(self, node_id, current_time):
-        already_dead = node_id in self.node_death_times
-        if not already_dead:
-            self.node_death_times[node_id] = current_time
-            self.alive_nodes -= 1
-        if not already_dead and node_id in self._critical_nodes_seen:
+        first_death = node_id not in self.node_death_times
+        was_currently_dead = node_id in self._currently_dead_nodes
+        if first_death:
+            self.node_death_times[node_id] = float(current_time)
+        if not was_currently_dead:
+            self._currently_dead_nodes.add(node_id)
+            self.alive_nodes = max(0, self.alive_nodes - 1)
+        if first_death and node_id in self._critical_nodes_seen:
             self.energy_critical_node_deaths += 1
             self.mc_missed_charging_deadlines += 1
             self._critical_nodes_seen.discard(node_id)
 
+    def record_node_revival(self, node_id, current_time=None):
+        if node_id in self._currently_dead_nodes:
+            self._currently_dead_nodes.discard(node_id)
+            self.alive_nodes = min(self.total_nodes, self.alive_nodes + 1)
+
+    def get_charging_request_wait_time(self, node_id, current_time):
+        first_seen = self._charging_request_first_seen_time.get(node_id)
+        if first_seen is None:
+            return 0.0
+        return max(0.0, float(current_time) - float(first_seen))
+
+    def record_fixed_charge(self, node_id, injected_energy):
+        injected_energy = max(0.0, float(injected_energy))
+        if injected_energy <= 0.0:
+            return
+        self.fixed_charger_charge_events += 1
+        self.fixed_charger_total_injected_energy += injected_energy
+
     def record_energy_state(self, current_avg_energy):
-        # Residual physical energy cannot be negative. Clamping here also makes
-        # exported aggregates robust to stale values from legacy runs.
         self.network_residual_energy_history.append(
             max(0.0, float(current_avg_energy))
         )
 
-    def add_mc_travel_distance(self, distance):
-        self.mc_travel_distance += distance
+    def add_mc_travel_distance(self, distance, energy_consumed=0.0):
+        self.mc_travel_distance += max(0.0, float(distance))
+        self.mc_travel_energy += max(0.0, float(energy_consumed))
+
+    def record_mc_charging_energy(self, energy_spent, *, rf_mode=False,
+                                  delivered_energy=0.0):
+        energy_spent = max(0.0, float(energy_spent))
+        delivered_energy = max(0.0, float(delivered_energy))
+        if rf_mode:
+            self.mc_rf_transmit_energy += energy_spent
+            self.rf_total_delivered_energy += delivered_energy
+        else:
+            self.mc_contact_charging_energy += energy_spent
 
     def record_execution_time(self, component, exec_time_ms):
         if component == 'EDGE':
@@ -202,11 +283,19 @@ class MetricsCollector:
             self.bs_processing_times.append(exec_time_ms)
 
     def record_charging_request(self, node_id, request_time, validated=True):
+        node_id = int(node_id)
+        request_time = float(request_time)
         if validated:
-            self.mc_validated_charging_requests += 1
-            self._charging_request_first_seen_time.setdefault(
-                node_id, float(request_time))
-        else:
+            if node_id not in self._active_charging_requests:
+                self.mc_validated_charging_requests += 1
+                self._active_charging_requests.add(node_id)
+                self._charging_request_first_seen_time.setdefault(
+                    node_id, request_time)
+            return
+
+        epoch_key = (node_id, int(request_time // 10.0))
+        if epoch_key not in self._rejected_charging_request_keys:
+            self._rejected_charging_request_keys.add(epoch_key)
             self.mc_rejected_charging_requests += 1
 
     def record_energy_critical(self, node_id, current_time):
@@ -225,6 +314,7 @@ class MetricsCollector:
         self.mc_total_injected_energy += injected_energy
         self.mc_total_charging_time += charging_time
         start_time = self._charging_request_first_seen_time.pop(node_id, None)
+        self._active_charging_requests.discard(int(node_id))
         if start_time is not None:
             self.mc_charging_response_times.append(
                 max(0.0, float(current_time) - float(start_time)))
@@ -233,7 +323,13 @@ class MetricsCollector:
             self._critical_nodes_seen.discard(node_id)
 
     # INNOVATION AUDIT RECORDING METHODS
-    def record_charging_decision(self, needed, admitted):
+    def record_charging_decision(self, needed, admitted, decision_key=None):
+        if decision_key is not None:
+            key = tuple(decision_key) if isinstance(
+                decision_key, (list, tuple)) else decision_key
+            if key in self._charging_decision_keys:
+                return
+            self._charging_decision_keys.add(key)
         needed = bool(needed)
         admitted = bool(admitted)
         if needed and admitted:
@@ -332,12 +428,15 @@ class MetricsCollector:
         return {"Overall_PDR": overall_pdr, "Critical_PDR": critical_pdr, "Throughput_bps": throughput, "Avg_Delay": avg_delay}
 
     def calculate_network_lifetime(self):
-        death_times = list(self.node_death_times.values())
-        death_times.sort()
-        fnd = death_times[0] if len(death_times) > 0 else -1
-        hnd = death_times[len(
-            death_times)//2] if len(death_times) >= (self.total_nodes // 2) else -1
-        lnd = death_times[-1] if len(death_times) == self.total_nodes else -1
+        death_times = sorted(self.node_death_times.values())
+        fnd = death_times[0] if death_times else -1
+
+        half_dead_count = max(1, int(math.ceil(self.total_nodes / 2.0)))
+        hnd = (death_times[half_dead_count - 1]
+               if len(death_times) >= half_dead_count else -1)
+        lnd = (death_times[self.total_nodes - 1]
+               if self.total_nodes > 0 and len(death_times) >= self.total_nodes
+               else -1)
         return {"FND": fnd, "HND": hnd, "LND": lnd}
 
     def calculate_overhead_ratio(self, phase='total'):
@@ -396,6 +495,12 @@ class MetricsCollector:
             'Mobile_Charger_Max_Sensor_Equivalent_Capacity': float(getattr(self, 'mobile_charger_max_sensor_equivalent_capacity', 0.0)),
             'Mobile_Charger_Avg_Travel_Energy_Cost_Per_M': float(getattr(self, 'mobile_charger_avg_travel_energy_cost_per_m', 0.0)),
             'MC_Travel_Distance': self.mc_travel_distance,
+            'MC_Travel_Energy': self.mc_travel_energy,
+            'MC_RF_Transmit_Energy': self.mc_rf_transmit_energy,
+            'MC_Contact_Charging_Energy': self.mc_contact_charging_energy,
+            'MC_Total_Mission_Energy': (self.mc_travel_energy + self.mc_rf_transmit_energy + self.mc_contact_charging_energy),
+            'RF_End_To_End_Efficiency': self._safe_rate(self.rf_total_delivered_energy, self.mc_rf_transmit_energy),
+            'MC_End_To_End_Useful_Efficiency': self._safe_rate(self.mc_total_injected_energy, self.mc_travel_energy + self.mc_rf_transmit_energy + self.mc_contact_charging_energy),
             'MC_Charge_Events': self.mc_charge_events,
             'MC_Total_Injected_Energy': self.mc_total_injected_energy,
             'MC_Total_Charging_Time': self.mc_total_charging_time,
@@ -411,12 +516,50 @@ class MetricsCollector:
             'MC_Rejected_Unauth_Reports': self.mc_rejected_unauth_reports,
             'MC_Location_Spoof_Attempts': self.mc_location_spoof_attempts,
             'MC_Location_Spoof_Accepted': self.mc_location_spoof_accepted,
+            'MC_Location_Verification_Checks': self.mc_location_verification_checks,
+            'MC_Location_Verification_Passes': self.mc_location_verification_passes,
+            'MC_Location_Verification_Failures': self.mc_location_verification_failures,
+            'MC_Actual_Location_Spoof_Detections': self.mc_location_spoof_detections,
             'MC_Raw_SOS_Dispatches': self.mc_raw_sos_dispatches,
             'MC_TPM_Compromise_Events': self.mc_tpm_compromise_events,
             'MC_TPM_Zeroized_Events': self.mc_tpm_zeroized_events,
             'Source_Sequence_Replay_Events': self.source_sequence_replay_events,
             'Packet_HMAC_Failures': self.packet_hmac_failures,
+            'Adaptive_K_opt_Avg': float(np.mean(self.adaptive_k_opts)) if self.adaptive_k_opts else 0.0,
         }
+
+        if self.data_routing_diagnostics_history:
+            diagnostic_keys = sorted({
+                key for row in self.data_routing_diagnostics_history
+                for key in row
+            })
+            export_names = {
+                'primary_replaced_count': 'Data_Routing_Primary_Replaced_Avg',
+                'cluster_mst_primary_count': 'Data_Routing_Cluster_MST_Primary_Avg',
+                'backbone_biased_primary_count': 'Data_Routing_Backbone_Biased_Primary_Avg',
+                'energy_shortest_primary_count': 'Data_Routing_Energy_Shortest_Primary_Avg',
+                'projected_primary_energy_ratio': 'Data_Routing_Projected_Energy_Ratio_Avg',
+                'secondary_replaced_count': 'Data_Routing_Secondary_Replaced_Avg',
+                'secondary_node_disjoint_count': 'Data_Routing_Secondary_Node_Disjoint_Avg',
+                'secondary_edge_disjoint_count': 'Data_Routing_Secondary_Edge_Disjoint_Avg',
+                'secondary_average_node_overlap': 'Data_Routing_Secondary_Node_Overlap_Avg',
+                'secondary_standby_count': 'Data_Routing_Secondary_Standby_Avg',
+            }
+            for key in diagnostic_keys:
+                values = [row[key]
+                          for row in self.data_routing_diagnostics_history if key in row]
+                if values:
+                    name = export_names.get(key, f'Data_Routing_{key}_Avg')
+                    summary[name] = float(np.mean(values))
+        else:
+            summary.update({
+                'Data_Routing_Primary_Replaced_Avg': 0.0,
+                'Data_Routing_Cluster_MST_Primary_Avg': 0.0,
+                'Data_Routing_Projected_Energy_Ratio_Avg': 1.0,
+                'Data_Routing_Secondary_Replaced_Avg': 0.0,
+                'Data_Routing_Secondary_Node_Disjoint_Avg': 0.0,
+                'Data_Routing_Secondary_Node_Overlap_Avg': 0.0,
+            })
 
         response_times = list(self.mc_charging_response_times)
         summary['MC_Charging_Response_Time_Avg'] = float(
@@ -466,6 +609,8 @@ class MetricsCollector:
             np.mean(self.dqn_reward_travel_components)) if self.dqn_reward_travel_components else 0.0
         summary['DQN_Reward_Revisit_Component_Avg'] = float(
             np.mean(self.dqn_reward_revisit_components)) if self.dqn_reward_revisit_components else 0.0
+        summary['DQN_Reward_Death_Component_Avg'] = float(
+            np.mean(self.dqn_reward_death_components)) if self.dqn_reward_death_components else 0.0
         summary['MC_Service_Duration_Avg'] = float(
             np.mean(self.mc_service_durations)) if self.mc_service_durations else 0.0
         summary['MC_Fail_Closed_Rejections'] = int(
@@ -489,8 +634,11 @@ class MetricsCollector:
             self.mc_travel_distance, self.mc_total_injected_energy)
         summary['MC_Charge_Events_Per_Critical_Node'] = self._safe_rate(
             self.mc_charge_events, self.energy_critical_node_events)
+        resolved_deadlines = (
+            self.mc_avoided_node_deaths + self.mc_missed_charging_deadlines
+        )
         summary['MC_Deadline_Failure_Rate'] = self._safe_rate(
-            self.mc_missed_charging_deadlines, self.energy_critical_node_events)
+            self.mc_missed_charging_deadlines, resolved_deadlines)
         summary['Energy_Critical_Death_Rate'] = self._safe_rate(
             self.energy_critical_node_deaths, self.energy_critical_node_events)
         summary['MC_Useless_Charge_Rate_Heuristic'] = self._safe_rate(
@@ -547,7 +695,7 @@ class MetricsCollector:
         summary['Avg_Time_To_Critical_Before_MC_Arrival'] = float(np.mean(
             self.time_to_critical_before_mc_arrival)) if self.time_to_critical_before_mc_arrival else 0.0
         summary['MC_Deadline_Success_Rate'] = self._safe_rate(
-            self.mc_avoided_node_deaths, self.mc_avoided_node_deaths + self.mc_missed_charging_deadlines)
+            self.mc_avoided_node_deaths, resolved_deadlines)
 
         summary['Forged_MC_Report_Rejection_Rate'] = self._safe_rate(
             self.mc_rejected_unauth_reports, self.mc_fake_reports_attempted)
@@ -558,7 +706,7 @@ class MetricsCollector:
         summary['Charge_Hoarder_Detection_Rate'] = self._safe_rate(
             self.charge_hoarder_detections, self.charge_hoarder_attempts)
         summary['Location_Spoof_Rejection_Rate'] = self._safe_rate(
-            self.mc_location_spoof_attempts - self.mc_location_spoof_accepted, self.mc_location_spoof_attempts)
+            self.mc_location_spoof_detections, self.mc_location_spoof_attempts)
         summary['Raw_SOS_Blocking_Rate'] = self._safe_rate(
             self.raw_sos_blocked, self.raw_sos_validation_attempts)
 
@@ -593,9 +741,45 @@ class MetricsCollector:
         summary['Critical_Redundant_Copy_Rejected_Count'] = self.critical_redundant_copy_rejected
         summary['Sparse_Topology_NoBackup_Count'] = self.sparse_topology_no_backup_count
 
-        # Export the complete resolved scenario configuration. Numeric and
-        # boolean values are included in CI summaries; structured values are
-        # serialized in the raw result CSV for exact reproducibility.
+        summary['RF_Cluster_Charge_Events'] = int(
+            getattr(self, 'rf_cluster_charge_events', 0))
+        summary['RF_Total_Nodes_Charged_In_Clusters'] = int(
+            getattr(self, 'rf_total_nodes_charged_in_clusters', 0))
+        summary['RF_Avg_Nodes_Per_Cluster'] = self._safe_rate(
+            getattr(self, 'rf_total_nodes_charged_in_clusters', 0),
+            getattr(self, 'rf_cluster_charge_events', 0)
+        )
+        summary['Dynamic_Partial_Charge_Events'] = int(
+            getattr(self, 'dynamic_partial_charge_events', 0))
+        summary['Fixed_Charger_Charge_Events'] = int(
+            getattr(self, 'fixed_charger_charge_events', 0))
+        summary['Fixed_Charger_Total_Injected_Energy'] = float(
+            getattr(self, 'fixed_charger_total_injected_energy', 0.0))
+        summary['Fixed_Charger_Active_Nodes'] = int(
+            getattr(self, 'fixed_charger_active_nodes', 0))
+        summary['MC_Infeasible_Mission_Rejections'] = int(
+            getattr(self, 'mc_infeasible_mission_rejections', 0))
+        summary['MC_Stranded_Events'] = int(
+            getattr(self, 'mc_stranded_events', 0))
+        summary['DQN_Travel_Penalty_Magnitude_Avg'] = summary.get(
+            'DQN_Reward_Travel_Component_Avg', 0.0)
+        summary['DQN_Revisit_Penalty_Magnitude_Avg'] = summary.get(
+            'DQN_Reward_Revisit_Component_Avg', 0.0)
+        summary['MC_Async_Missions_Started'] = int(
+            getattr(self, 'mc_async_missions_started', 0))
+        summary['MC_Async_Missions_Completed'] = int(
+            getattr(self, 'mc_async_missions_completed', 0))
+        summary['MC_Async_Missions_Incomplete'] = int(
+            getattr(self, 'mc_async_missions_incomplete', 0))
+        summary['MC_Network_Events_While_Busy'] = int(
+            getattr(self, 'mc_network_events_while_busy', 0))
+        summary['Charging_Service_Pool_Admissions'] = int(getattr(
+            self, 'charging_service_pool_admissions', 0))
+        summary['Charging_Plus_Pool_Admissions'] = int(getattr(
+            self, 'charging_plus_pool_admissions', 0))
+        summary['Charging_Opportunistic_Plus_Charges'] = int(getattr(
+            self, 'charging_opportunistic_plus_charges', 0))
+
         for key, value in sorted(self.experiment_parameters.items()):
             safe_key = re.sub(r'[^0-9A-Za-z_]+', '_', str(key)).strip('_')
             column = f'Config_{safe_key}'
