@@ -31,6 +31,40 @@ def _resolve_torch_device(device: Optional[str]):
     return torch.device(requested)
 
 
+def configure_torch_runtime(
+    seed: int,
+    *,
+    deterministic: bool = True,
+    strict_determinism: bool = False,
+    allow_tf32: bool = False,
+) -> None:
+    """Configure a reproducible PyTorch runtime for research experiments.
+
+    Determinism is guaranteed only for the same software stack and compatible
+    hardware.  TF32 is disabled by default because it can alter numerical
+    results on recent NVIDIA GPUs.
+    """
+    if torch is None:
+        return
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    try:
+        torch.use_deterministic_algorithms(
+            bool(deterministic), warn_only=not bool(strict_determinism))
+    except TypeError:
+        torch.use_deterministic_algorithms(bool(deterministic))
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = False
+        if hasattr(torch.backends.cudnn, "allow_tf32"):
+            torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+    except Exception:
+        pass
+
+
 def _is_adaptive_value(value) -> bool:
     """Return True for unset/string values that request analytical tuning."""
     if value is None:

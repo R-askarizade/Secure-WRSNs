@@ -194,10 +194,16 @@ class BaseStation:
             self.ablation.get('qifl_threshold_lower_bound', 0.18))
         self.qifl_threshold_upper_bound = float(
             self.ablation.get('qifl_threshold_upper_bound', 0.52))
+        adaptive_device = self.ablation.get('adaptive_compute_device')
+        if adaptive_device is None:
+            adaptive_device = (
+                'auto' if self.ablation.get(
+                    'use_gpu_for_adaptive_charging', True) else 'cpu')
         self.qifl_oracle = QuantumFuzzyChargingOracle(
             threshold_centers=self.ablation.get(
                 'qifl_threshold_centers', (0.18, 0.26, 0.34, 0.42, 0.50)),
             lr=float(self.ablation.get('qifl_learning_rate', 2.5e-3)),
+            device=str(adaptive_device),
             seed=int(self.ablation.get('qifl_seed', 42)))
         self.last_charge_time_by_node = defaultdict(lambda: -float('inf'))
         self.last_selected_charge_time_by_node = defaultdict(

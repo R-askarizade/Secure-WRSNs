@@ -1,7 +1,11 @@
+import os
 import random
 import math
 import json
 import inspect
+import platform
+import sys
+from importlib import metadata as importlib_metadata
 from collections import defaultdict
 import numpy as np
 import networkx as nx
@@ -12,14 +16,14 @@ from base_station import BaseStation
 from mobile_charger import MobileCharger
 from metric_collector import MetricsCollector
 from routing import BaselineRouting, DataPlaneHybridRouting
-from adaptive_charging import ChargerRoutingDQN
+from adaptive_charging import ChargerRoutingDQN, configure_torch_runtime, torch
 
 
 class SimulatorManager:
     def __init__(self, num_nodes, sim_time, ablation_config, seed, network_size=(100, 100)):
         self.num_nodes = num_nodes
         self.sim_time = sim_time
-        self.ablation = ablation_config
+        self.ablation = dict(ablation_config)
         self.seed = seed
         self.network_size = network_size
         self.BS_ID = 0
@@ -40,6 +44,28 @@ class SimulatorManager:
         self.attack_rng = random.Random(int(self.seed) + 200_003)
         self.key_rng = random.Random(int(self.seed) + 300_007)
         self.tpm_rng = random.Random(int(self.seed) + 400_009)
+
+        default_device = (
+            'auto' if self.ablation.get(
+                'use_gpu_for_adaptive_charging', True) else 'cpu')
+        self.adaptive_device_request = str(os.environ.get(
+            'WRSN_ADAPTIVE_DEVICE',
+            self.ablation.get('adaptive_compute_device', default_device),
+        )).strip().lower()
+        self.ablation['adaptive_compute_device'] = self.adaptive_device_request
+
+        self.torch_deterministic = bool(
+            self.ablation.get('adaptive_torch_deterministic', True))
+        self.torch_strict_determinism = bool(
+            self.ablation.get('adaptive_torch_strict_determinism', False))
+        self.torch_allow_tf32 = bool(
+            self.ablation.get('adaptive_torch_allow_tf32', False))
+        configure_torch_runtime(
+            int(self.seed),
+            deterministic=self.torch_deterministic,
+            strict_determinism=self.torch_strict_determinism,
+            allow_tf32=self.torch_allow_tf32,
+        )
 
         self.metrics = MetricsCollector(
             total_nodes=num_nodes, total_rounds_or_time=sim_time)
@@ -167,8 +193,7 @@ class SimulatorManager:
 
         self.use_dqn_charger_routing = bool(
             self.ablation.get('use_dqn_charger_routing', False))
-        adaptive_device = ('auto' if self.ablation.get(
-            'use_gpu_for_adaptive_charging', True) else 'cpu')
+        adaptive_device = self.adaptive_device_request
         self.charger_dqn = ChargerRoutingDQN(
             lr=self.ablation.get('dqn_learning_rate', 1.0e-3),
             gamma=self.ablation.get('dqn_gamma', 0.80),
@@ -196,6 +221,43 @@ class SimulatorManager:
                 'adaptive_expected_mission_time_s', 90.0)),
             safe_horizon=float(self.ablation.get('qifl_safe_horizon_s', 3600.0)))
 
+        adaptive_qifl_active = bool(
+            self.ablation.get('use_adaptive_quantum_charging', False))
+        adaptive_dqn_active = bool(
+            self.ablation.get('use_dqn_charger_routing', False))
+        adaptive_active = adaptive_qifl_active or adaptive_dqn_active
+        require_torch = self._env_flag(
+            'WRSN_REQUIRE_TORCH',
+            self.ablation.get('require_pytorch_for_adaptive_charging', True),
+        )
+        require_cuda = self._env_flag(
+            'WRSN_REQUIRE_CUDA',
+            self.ablation.get('require_cuda_for_adaptive_charging', False),
+        )
+        missing_torch_components = []
+        if adaptive_qifl_active and not self.bs.qifl_oracle.enabled_torch:
+            missing_torch_components.append('QIFL')
+        if adaptive_dqn_active and not self.charger_dqn.enabled_torch:
+            missing_torch_components.append('DQN')
+        if adaptive_active and require_torch and missing_torch_components:
+            raise RuntimeError(
+                'PyTorch is required for the configured adaptive method; '
+                f"fallback is disabled for: {', '.join(missing_torch_components)}")
+
+        active_devices = []
+        if adaptive_qifl_active:
+            active_devices.append(('QIFL', getattr(
+                self.bs.qifl_oracle, 'device', None)))
+        if adaptive_dqn_active:
+            active_devices.append(('DQN', getattr(
+                self.charger_dqn, 'device', None)))
+        non_cuda = [name for name, device in active_devices
+                    if getattr(device, 'type', '') != 'cuda']
+        if adaptive_active and require_cuda and non_cuda:
+            raise RuntimeError(
+                'CUDA is required for the configured adaptive method, but '
+                f"these components are not on CUDA: {', '.join(non_cuda)}")
+
         self.metrics.dqn_torch_enabled = bool(self.charger_dqn.enabled_torch)
         self.metrics.qifl_torch_enabled = bool(
             self.bs.qifl_oracle.enabled_torch)
@@ -204,6 +266,11 @@ class SimulatorManager:
             getattr(getattr(self.charger_dqn, 'device', None), 'type', '') == 'cuda')
         self.metrics.adaptive_compute_device = str(
             getattr(self.charger_dqn, 'device', None) or 'numpy')
+        self.metrics.experiment_parameters.update(
+            self._runtime_environment_metadata(
+                require_torch=require_torch,
+                require_cuda=require_cuda,
+            ))
 
         self.nodes = {}
 
@@ -222,6 +289,64 @@ class SimulatorManager:
         self.active_charger_missions = {}
         self.reprovision_events = {}
         self._mission_sequence = 0
+
+    @staticmethod
+    def _env_flag(name, default=False):
+        raw = os.environ.get(name)
+        if raw is None:
+            return bool(default)
+        return str(raw).strip().lower() not in {
+            '', '0', 'false', 'no', 'off', 'none'
+        }
+
+    def _runtime_environment_metadata(self, *, require_torch, require_cuda):
+        def version(distribution):
+            try:
+                return importlib_metadata.version(distribution)
+            except importlib_metadata.PackageNotFoundError:
+                return 'not-installed'
+
+        cuda_available = bool(torch is not None and torch.cuda.is_available())
+        gpu_names = []
+        if cuda_available:
+            for index in range(torch.cuda.device_count()):
+                gpu_names.append(torch.cuda.get_device_name(index))
+        return {
+            'Runtime_Python_Version': platform.python_version(),
+            'Runtime_Python_Implementation': platform.python_implementation(),
+            'Runtime_Platform': platform.platform(),
+            'Runtime_NumPy_Version': np.__version__,
+            'Runtime_NetworkX_Version': nx.__version__,
+            'Runtime_SciPy_Version': version('scipy'),
+            'Runtime_Pandas_Version': version('pandas'),
+            'Runtime_Scikit_Learn_Version': version('scikit-learn'),
+            'Runtime_PyTorch_Version': (
+                getattr(torch, '__version__', 'not-installed')
+                if torch is not None else 'not-installed'),
+            'Runtime_CUDA_Available': cuda_available,
+            'Runtime_CUDA_Runtime_Version': (
+                getattr(getattr(torch, 'version', None), 'cuda', None)
+                if torch is not None else None),
+            'Runtime_GPU_Names': gpu_names,
+            'Runtime_Adaptive_Device_Request': self.adaptive_device_request,
+            'Runtime_Require_PyTorch': bool(require_torch),
+            'Runtime_Require_CUDA': bool(require_cuda),
+            'Runtime_Torch_Deterministic': self.torch_deterministic,
+            'Runtime_Torch_Strict_Determinism': self.torch_strict_determinism,
+            'Runtime_Torch_Allow_TF32': self.torch_allow_tf32,
+            'Runtime_Master_Seed': int(self.seed),
+            'Runtime_Topology_Seed': int(self.seed),
+            'Runtime_Event_Seed': int(self.seed) + 100_003,
+            'Runtime_Attack_Seed': int(self.seed) + 200_003,
+            'Runtime_Key_Seed': int(self.seed) + 300_007,
+            'Runtime_TPM_Seed': int(self.seed) + 400_009,
+            'Runtime_QIFL_Seed': int(self.ablation.get('qifl_seed', 42)),
+            'Runtime_DQN_Seed': int(
+                self.ablation.get('dqn_seed', self.seed + 1000)),
+            'Runtime_Quantum_Claim_Scope': (
+                'quantum-inspired probabilistic fuzzy representation; '
+                'classical PyTorch/CUDA implementation'),
+        }
 
     @staticmethod
     def _as_list(value, default=None):

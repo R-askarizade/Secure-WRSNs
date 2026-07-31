@@ -387,9 +387,20 @@ class MetricsCollector:
         self.critical_redundant_copy_rejected += int(max(0, rejected))
 
     @staticmethod
-    def _safe_rate(num, den, scale=1.0):
-        den = float(den)
-        return (float(num) / den) * scale if den > 0 else 0.0
+    def _safe_rate(num, den, scale=1.0, undefined=0.0):
+        """Return a rate with an explicit zero-denominator policy.
+
+        Most operational counters retain the historical ``0.0`` fallback.
+        Scientific ratios whose denominator represents an observed event use
+        ``undefined=np.nan`` so that "not applicable" is not silently reported
+        as a measured zero.
+        """
+        try:
+            den = float(den)
+            num = float(num)
+        except (TypeError, ValueError):
+            return undefined
+        return (num / den) * scale if den > 0.0 else undefined
 
     def calculate_ids_metrics(self):
         tp, tn, fp, fn = self.tp, self.tn, self.fp, self.fn
@@ -633,14 +644,22 @@ class MetricsCollector:
         summary['MC_Travel_Per_Charged_Joule'] = self._safe_rate(
             self.mc_travel_distance, self.mc_total_injected_energy)
         summary['MC_Charge_Events_Per_Critical_Node'] = self._safe_rate(
-            self.mc_charge_events, self.energy_critical_node_events)
+            self.mc_charge_events, self.energy_critical_node_events,
+            undefined=np.nan)
         resolved_deadlines = (
             self.mc_avoided_node_deaths + self.mc_missed_charging_deadlines
         )
+        summary['MC_Resolved_Deadline_Events'] = int(resolved_deadlines)
+        summary['MC_Critical_Event_Rate_Defined_Flag'] = int(
+            self.energy_critical_node_events > 0)
+        summary['MC_Deadline_Rate_Defined_Flag'] = int(
+            resolved_deadlines > 0)
         summary['MC_Deadline_Failure_Rate'] = self._safe_rate(
-            self.mc_missed_charging_deadlines, resolved_deadlines)
+            self.mc_missed_charging_deadlines, resolved_deadlines,
+            undefined=np.nan)
         summary['Energy_Critical_Death_Rate'] = self._safe_rate(
-            self.energy_critical_node_deaths, self.energy_critical_node_events)
+            self.energy_critical_node_deaths, self.energy_critical_node_events,
+            undefined=np.nan)
         summary['MC_Useless_Charge_Rate_Heuristic'] = self._safe_rate(
             self.mc_useless_charge_events, self.mc_charge_events)
         summary['MC_Repeated_Service_Events'] = int(
@@ -695,7 +714,8 @@ class MetricsCollector:
         summary['Avg_Time_To_Critical_Before_MC_Arrival'] = float(np.mean(
             self.time_to_critical_before_mc_arrival)) if self.time_to_critical_before_mc_arrival else 0.0
         summary['MC_Deadline_Success_Rate'] = self._safe_rate(
-            self.mc_avoided_node_deaths, resolved_deadlines)
+            self.mc_avoided_node_deaths, resolved_deadlines,
+            undefined=np.nan)
 
         summary['Forged_MC_Report_Rejection_Rate'] = self._safe_rate(
             self.mc_rejected_unauth_reports, self.mc_fake_reports_attempted)

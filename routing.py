@@ -649,16 +649,18 @@ class DataPlaneHybridRouting:
             float(self._cfg('data_member_to_ch_cost_ratio', 1.35)), 1.0)
         for source in sorted(nid for nid in graph if nid != self.bs_id and nid not in heads):
             try:
-                direct_cost = nx.shortest_path_length(
-                    graph, source, self.bs_id, weight='weight')
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                # One Dijkstra traversal provides the distance to the BS and
+                # every candidate head.  The previous implementation launched
+                # a separate Dijkstra call for each destination.
+                lengths = nx.single_source_dijkstra_path_length(
+                    graph, source, weight='weight')
+                direct_cost = lengths[self.bs_id]
+            except (nx.NetworkXNoPath, nx.NodeNotFound, KeyError):
                 continue
             choices = []
             for head in heads:
-                try:
-                    cost = nx.shortest_path_length(
-                        graph, source, head, weight='weight')
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                cost = lengths.get(head)
+                if cost is None:
                     continue
                 if cost > max_cost_ratio * max(direct_cost, 1e-12):
                     continue
@@ -673,10 +675,9 @@ class DataPlaneHybridRouting:
                 if bool(self._cfg('use_fcbe_soft_balancing', True)):
                     _, head = min(choices)
                 else:
-                    head = min(
-                        (item[1] for item in choices),
-                        key=lambda candidate: nx.shortest_path_length(
-                            graph, source, candidate, weight='weight'))
+                    # ``choices`` already contains the exact shortest-path
+                    # length, so avoid recomputing it.
+                    _, head = min(choices, key=lambda item: lengths[item[1]])
                 clusters[head].append(source)
                 member_to_head[source] = head
         return clusters, member_to_head
@@ -962,11 +963,28 @@ class DataPlaneHybridRouting:
                 factor += edge_penalty
             return float(data.get('weight', 1.0)) * factor
 
+        # One reverse Dijkstra traversal yields the overlap-penalised shortest
+        # suffix from every node to the BS.  The previous code repeated a full
+        # shortest-path search for the source and for every alternate first
+        # hop, although all of them used the same edge-weight function.
+        overlap_paths_to_bs = {}
+        reverse_graph = graph.reverse(copy=False)
+
+        def reverse_overlap_weight(u, v, data):
+            return overlap_weight(v, u, data)
+
         try:
-            candidates.append(nx.shortest_path(
-                graph, source, self.bs_id, weight=overlap_weight))
+            _, reverse_paths = nx.single_source_dijkstra(
+                reverse_graph, self.bs_id, weight=reverse_overlap_weight)
+            overlap_paths_to_bs = {
+                node: list(reversed(path))
+                for node, path in reverse_paths.items()
+            }
+            source_path = overlap_paths_to_bs.get(source)
+            if source_path:
+                candidates.append(source_path)
         except (nx.NetworkXNoPath, nx.NodeNotFound):
-            pass
+            overlap_paths_to_bs = {}
 
         # Explore a small number of alternate first hops.  This often finds a
         # different physical corridor when strict node-disjoint routing does
@@ -982,13 +1000,10 @@ class DataPlaneHybridRouting:
             neighbors.append((edge_weight, neighbor))
         neighbors.sort()
         for _, neighbor in neighbors[:neighbor_budget]:
-            try:
-                suffix = nx.shortest_path(
-                    graph, neighbor, self.bs_id, weight=overlap_weight)
+            suffix = overlap_paths_to_bs.get(neighbor)
+            if suffix:
                 path = [source] + list(suffix)
                 candidates.append(path)
-            except (nx.NetworkXNoPath, nx.NodeNotFound):
-                continue
 
         unique, seen = [], {tuple(primary)}
         for path in candidates:
@@ -1008,25 +1023,35 @@ class DataPlaneHybridRouting:
             graph, primary, ref_secondary) if ref_valid else None
         primary_vec = self._path_vector(graph, primary)
 
+        ref_pair_total = None
+        ref_pair_max = None
+        ref_pair_p95 = None
+        if ref_valid:
+            ref_pair = self._vector_add(
+                self._path_vector(graph, ref_primary),
+                self._path_vector(graph, ref_secondary),
+            )
+            ref_pair_total = self._vector_total(ref_pair)
+            ref_pair_max, ref_pair_p95 = self._stress_stats(ref_pair, nodes)
+
         candidates = self._secondary_candidates(graph, source, primary)
         scored = []
+        candidate_qualities = []
         max_cost_stretch = max(
             float(self._cfg('data_secondary_max_energy_stretch', 1.0)), 1.0)
         for path in candidates:
             quality = self._secondary_quality(graph, primary, path)
+            candidate_qualities.append((path, quality))
             if ref_quality is not None and quality['energy'] > ref_quality['energy'] * max_cost_stretch + 1e-15:
                 continue
             # Combined primary+secondary energy may not exceed the original
             # critical-pair energy.  This protects FND and charging demand.
             if ref_valid:
-                ref_pair = self._vector_add(self._path_vector(
-                    graph, ref_primary), self._path_vector(graph, ref_secondary))
                 cand_pair = self._vector_add(primary_vec, quality['vector'])
-                if self._vector_total(cand_pair) > self._vector_total(ref_pair) + 1e-15:
+                if self._vector_total(cand_pair) > ref_pair_total + 1e-15:
                     continue
-                ref_max, ref_p95 = self._stress_stats(ref_pair, nodes)
                 cand_max, cand_p95 = self._stress_stats(cand_pair, nodes)
-                if cand_max > ref_max + 1e-15 or cand_p95 > ref_p95 + 1e-15:
+                if cand_max > ref_pair_max + 1e-15 or cand_p95 > ref_pair_p95 + 1e-15:
                     continue
             score = (
                 quality['class'], quality['node_overlap_ratio'],
@@ -1035,21 +1060,30 @@ class DataPlaneHybridRouting:
             )
             scored.append((score, path, quality))
         if not scored:
-            return ref_secondary if ref_valid else [], 'reference_kept' if ref_valid else 'none'
+            return (ref_secondary if ref_valid else [],
+                    'reference_kept' if ref_valid else 'none', [])
         scored.sort(key=lambda item: item[0])
         best_score, best_path, best_quality = scored[0]
         if ref_quality is None:
             # Do not add a second transmitted copy where the original method
             # had none; retain it only as a standby repair route.
-            return [], 'standby_only'
+            standby_path = min(
+                candidate_qualities,
+                key=lambda item: (
+                    item[1]['class'],
+                    item[1]['node_overlap_ratio'],
+                    item[1]['energy'],
+                ),
+            )[0] if candidate_qualities else []
+            return [], 'standby_only', list(standby_path)
         ref_score = (
             ref_quality['class'], ref_quality['node_overlap_ratio'],
             ref_quality['edge_overlap_ratio'], ref_quality['risk'],
             ref_quality['energy'], ref_quality['hops'], ref_quality['distance'],
         )
         if best_score < ref_score:
-            return list(best_path), 'replaced'
-        return ref_secondary, 'reference_kept'
+            return list(best_path), 'replaced', []
+        return ref_secondary, 'reference_kept', []
 
     @staticmethod
     def _empty_table():
@@ -1163,26 +1197,12 @@ class DataPlaneHybridRouting:
             primary = selected.get(source, ref_primary)
             ref_table = reference_tables.get(source, {}) or {}
             ref_secondary = list(ref_table.get('secondary_path') or [])
-            secondary, status = self._choose_secondary(
+            secondary, status, standby = self._choose_secondary(
                 graph, active_nodes_dict, source, primary,
                 ref_primary, ref_secondary,
             )
-            standby = []
-            if status == 'standby_only':
-                candidates = self._secondary_candidates(graph, source, primary)
-                if candidates:
-                    standby = min(
-                        candidates,
-                        key=lambda path: (
-                            self._secondary_quality(
-                                graph, primary, path)['class'],
-                            self._secondary_quality(graph, primary, path)[
-                                'node_overlap_ratio'],
-                            self._secondary_quality(
-                                graph, primary, path)['energy'],
-                        ),
-                    )
-                    standby_count += 1
+            if status == 'standby_only' and standby:
+                standby_count += 1
             if status == 'replaced':
                 secondary_replaced += 1
             elif status == 'reference_kept':

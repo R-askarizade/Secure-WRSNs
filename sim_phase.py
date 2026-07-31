@@ -4,6 +4,11 @@ import random
 import numpy as np
 import pandas as pd
 
+import os
+
+# Must be configured before importing PyTorch or initializing CUDA.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 from config import compute_packet_hash, make_mc_mac, summarize_results, make_plots,  DATA_PACKET_BITS, CONTROL_PACKET_BYTES_SMALL, DATA_PACKET_BYTES
 from metric_collector import MetricsCollector
 from base_station import BaseStation
@@ -107,6 +112,12 @@ def _base_config():
         'dqn_warmup_updates': 32,
         'dqn_warmup_competitive_decisions': 24,
         'use_gpu_for_adaptive_charging': True,
+        'adaptive_compute_device': 'auto',
+        'require_pytorch_for_adaptive_charging': True,
+        'require_cuda_for_adaptive_charging': False,
+        'adaptive_torch_deterministic': True,
+        'adaptive_torch_strict_determinism': False,
+        'adaptive_torch_allow_tf32': False,
         'sos_threshold_margin_ratio': 0.03,
 
         'use_charging_hysteresis': True,
@@ -1029,14 +1040,14 @@ def run_self_tests(verbose=True):
     return ok
 
 
-def _safe_div(num, den):
+def _safe_div(num, den, undefined=np.nan):
     try:
         den = float(den)
         if den == 0.0:
-            return 0.0
+            return undefined
         return float(num) / den
     except Exception:
-        return 0.0
+        return undefined
 
 
 def _add_charging_efficiency_diagnostics(df):
@@ -1058,26 +1069,39 @@ def _add_charging_efficiency_diagnostics(df):
     qifl_loss = df.get('QIFL_Training_Loss_Avg', zeros).astype(float)
     dqn_loss = df.get('DQN_Training_Loss_Avg', zeros).astype(float)
 
-    df['MC_Injected_Energy_Per_Charge_Event'] = [
-        _safe_div(e, c) for e, c in zip(injected, charge_events)
-    ]
-    df['MC_Travel_Per_Charged_Joule'] = [
-        _safe_div(t, e) for t, e in zip(travel, injected)
-    ]
-    df['MC_Charge_Events_Per_Critical_Node'] = [
-        _safe_div(c, max(1.0, ce)) for c, ce in zip(charge_events, critical_events)
-    ]
-    df['MC_Deadline_Failure_Rate'] = [
-        _safe_div(m, max(1.0, ce)) for m, ce in zip(deadlines_missed, critical_events)
-    ]
-    df['Energy_Critical_Death_Rate'] = [
-        _safe_div(d, max(1.0, ce)) for d, ce in zip(deaths, critical_events)
-    ]
+    # MetricsCollector is the canonical owner of these definitions.  This
+    # post-processing function only backfills columns for legacy CSV files and
+    # must never overwrite values already exported by MetricsCollector.
+    if 'MC_Injected_Energy_Per_Charge_Event' not in df.columns:
+        df['MC_Injected_Energy_Per_Charge_Event'] = [
+            _safe_div(e, c) for e, c in zip(injected, charge_events)
+        ]
+    if 'MC_Travel_Per_Charged_Joule' not in df.columns:
+        df['MC_Travel_Per_Charged_Joule'] = [
+            _safe_div(t, e) for t, e in zip(travel, injected)
+        ]
+    if 'MC_Charge_Events_Per_Critical_Node' not in df.columns:
+        df['MC_Charge_Events_Per_Critical_Node'] = [
+            _safe_div(c, ce) for c, ce in zip(charge_events, critical_events)
+        ]
 
-    df['MC_Useless_Charge_Rate_Heuristic'] = [
-        1.0 if (c > 0 and _safe_div(e, c) < 1e-3) else 0.0
-        for e, c in zip(injected, charge_events)
-    ]
+    avoided = df.get('MC_Avoided_Node_Deaths', zeros).astype(float)
+    resolved_deadlines = avoided + deadlines_missed
+    if 'MC_Deadline_Failure_Rate' not in df.columns:
+        df['MC_Deadline_Failure_Rate'] = [
+            _safe_div(m, resolved)
+            for m, resolved in zip(deadlines_missed, resolved_deadlines)
+        ]
+    if 'Energy_Critical_Death_Rate' not in df.columns:
+        df['Energy_Critical_Death_Rate'] = [
+            _safe_div(d, ce) for d, ce in zip(deaths, critical_events)
+        ]
+
+    if 'MC_Useless_Charge_Rate_Heuristic' not in df.columns:
+        df['MC_Useless_Charge_Rate_Heuristic'] = [
+            1.0 if (c > 0 and _safe_div(e, c) < 1e-3) else 0.0
+            for e, c in zip(injected, charge_events)
+        ]
 
     df['QIFL_Learning_Active_Flag'] = [
         1.0 if x > 0 else 0.0 for x in qifl_loss]
@@ -1163,8 +1187,8 @@ def run_statistical_experiments():
 
 
 if __name__ == '__main__':
-    os.environ['WRSN_ENABLE_MULTI_MC_SCENARIOS'] = '2'
-    os.environ['WRSN_ENABLE_MC_COUNT_SWEEP'] = '1'
+    os.environ.setdefault('WRSN_ENABLE_MULTI_MC_SCENARIOS', '2')
+    os.environ.setdefault('WRSN_ENABLE_MC_COUNT_SWEEP', '1')
     if os.environ.get('WRSN_RUN_SELF_TESTS', '0').strip() == '1':
         run_self_tests(verbose=True)
     run_statistical_experiments()
