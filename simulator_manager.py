@@ -10,7 +10,7 @@ from collections import defaultdict
 import numpy as np
 import networkx as nx
 
-from config import compute_packet_hash, DATA_PACKET_BYTES
+from config import compute_packet_hash, DATA_PACKET_BYTES, ACK_PACKET_BITS
 from sensor_node import SensorNode
 from base_station import BaseStation
 from mobile_charger import MobileCharger
@@ -37,6 +37,10 @@ class SimulatorManager:
             self.ablation.get('control_packet_bits', 16 * 8)))
         self.control_packet_bytes = max(
             1, int(math.ceil(self.control_packet_bits / 8.0)))
+        self.ack_packet_bits = max(1.0, float(
+            self.ablation.get('ack_packet_bits', ACK_PACKET_BITS)))
+        self.implicit_mac_ack_mode = str(
+            self.ablation.get('implicit_mac_ack_mode', 'accounting')).strip().lower()
         self.source_seq_counters = defaultdict(int)
 
         self.topology_rng = random.Random(int(self.seed))
@@ -125,6 +129,15 @@ class SimulatorManager:
                 'control_packet_bits' not in self.ablation),
             'Article_Total_L_Override_Flag': False,
             'Article_Charging_Threshold_Inherited_Flag': True,
+            'Implicit_MAC_ACK_Always_Accounted_Flag': True,
+            'Implicit_MAC_ACK_Mode': self.implicit_mac_ack_mode,
+            'Bootstrap_Excluded_From_Operational_Horizon_Flag': True,
+            'Bootstrap_Registration_Is_Aggregate_Fixed_Timestep_Flag': True,
+            'Control_Epoch_Duration_s': 10.0,
+            'Simulation_Time_Model': 'continuous_event_driven_with_fixed_control_epochs',
+            'Adaptive_Training_Mode': 'online_warmup_and_safety_shielded',
+            'Charging_Audit_Enforcement_Mode': str(self.ablation.get('charging_audit_enforcement_mode', 'shadow')),
+            'Legacy_MC_Claim_Credit_Preserved_Flag': bool(self.ablation.get('preserve_legacy_mc_claim_credit', True)),
         })
 
         # Reference control/charging routing remains the original method.
@@ -576,6 +589,7 @@ class SimulatorManager:
                 current_node._consume_energy(tx_bytes=REG_SIZE, distance=dist)
                 if parent_id != self.BS_ID:
                     parent_node._consume_energy(rx_bytes=REG_SIZE)
+                self._account_implicit_mac_ack(current_n_id, parent_id, dist)
                 current_n_id = parent_id
 
             if not packet_dropped:
@@ -622,7 +636,20 @@ class SimulatorManager:
                     'charging_pool_class': None,
                     'adaptive_charge_threshold': 0.0,
                     'charge_satisfied': False,
-                    'hop_count_to_bs_norm': 0.0
+                    'hop_count_to_bs_norm': 0.0,
+                    'pending_mc_audit_energy': 0.0,
+                    'pending_mc_expected_post_energy': node.E_current,
+                    'energy_probation': False,
+                    'energy_recovery_streak': 0,
+                    'energy_violation_count': 0,
+                    'hard_veto_reason': None,
+                    'hard_veto_recoverable': False,
+                    'energy_audit_trust': 1.0,
+                    'energy_audit_recovery_streak': 0,
+                    'energy_recovery_reference_energy': node.E_current,
+                    'energy_recovery_reference_time': 0.0,
+                    'energy_recovery_last_epoch': None,
+                    'last_node_charge_receipt_consistent': None,
                 }
 
         self.current_time += 2.0
@@ -679,6 +706,7 @@ class SimulatorManager:
                     sender._consume_energy(tx_bytes=POLICY_SIZE, distance=dist)
                 if receiver_id != n_id:
                     receiver._consume_energy(rx_bytes=POLICY_SIZE)
+                self._account_implicit_mac_ack(sender_id, receiver_id, dist)
 
             target_node = self.nodes[n_id]
             target_node._consume_energy(rx_bytes=POLICY_SIZE)
@@ -704,6 +732,11 @@ class SimulatorManager:
                 is_critical=False, is_control=True, size_bytes=32, overhead_phase='setup')
         self.current_time += 0.5
 
+        self.metrics.experiment_parameters.update({
+            'Bootstrap_Setup_Time_s': float(self.current_time),
+            'Bootstrap_Data_Sensing_Enabled_Flag': False,
+            'Bootstrap_Setup_Energy_And_Overhead_Accounted_Flag': True,
+        })
         print(
             f"[Seed {self.seed}] Bootstrapping Complete. Temp trees cleared. Network Setup Time: {self.current_time}s")
 
@@ -1873,6 +1906,34 @@ class SimulatorManager:
         print(
             f"[ATTACK INJECTION] {num_attackers} malicious nodes injected into the network.")
 
+    def _account_implicit_mac_ack(self, sender_id, receiver_id, distance):
+        """Account a hardware MAC ACK without creating a network packet.
+
+        'accounting' is the non-regression default: ACK energy is measured and
+        used by BS trust accounting, but is not double-deducted from the legacy
+        aggregate radio envelope. 'strict_physical' additionally deducts the
+        sender RX and receiver TX costs from physical batteries.
+        """
+        sender = self.nodes.get(sender_id)
+        receiver = self.nodes.get(receiver_id)
+        if sender is None or receiver is None:
+            return
+        bits = self.ack_packet_bits
+        sender_rx = 0.0 if sender_id == self.BS_ID else bits * float(sender.E_elec)
+        if receiver_id == self.BS_ID:
+            receiver_tx = 0.0
+        elif distance <= float(receiver.d0):
+            receiver_tx = bits * (float(receiver.E_elec) + float(receiver.eps_fs) * distance ** 2)
+        else:
+            receiver_tx = bits * (float(receiver.E_elec) + float(receiver.eps_mp) * distance ** 4)
+        strict = self.implicit_mac_ack_mode in {'strict', 'strict_physical', 'physical'}
+        self.metrics.record_implicit_mac_ack(sender_rx + receiver_tx, physically_deducted=strict)
+        if strict:
+            if sender_id != self.BS_ID:
+                sender._consume_energy(rx_bits=bits)
+            if receiver_id != self.BS_ID:
+                receiver._consume_energy(tx_bits=bits, distance=distance)
+
     def run_simulation(self):
         def _trace_control_packet(source_id, packet):
             table = self.bs.routing_tables.get(source_id, {})
@@ -1905,6 +1966,12 @@ class SimulatorManager:
                 for idx in range(1, len(route)):
                     current_hop_id = route[idx]
                     if current_hop_id == self.BS_ID:
+                        sender_id = route[idx - 1]
+                        bs_distance = math.hypot(
+                            self.nodes[sender_id].x - self.nodes[self.BS_ID].x,
+                            self.nodes[sender_id].y - self.nodes[self.BS_ID].y)
+                        self._account_implicit_mac_ack(
+                            sender_id, self.BS_ID, bs_distance)
                         path_log.append(self.BS_ID)
                         break
 
@@ -1922,6 +1989,11 @@ class SimulatorManager:
                         distance = math.hypot(
                             hop_node.x - bs_node.x, hop_node.y - bs_node.y)
 
+                    sender_id = route[idx - 1]
+                    self._account_implicit_mac_ack(
+                        sender_id, current_hop_id,
+                        math.hypot(self.nodes[sender_id].x - self.nodes[current_hop_id].x,
+                                   self.nodes[sender_id].y - self.nodes[current_hop_id].y))
                     success = hop_node.forward_packet(
                         pkt, self.current_time, distance)
                     if not success:
@@ -2050,6 +2122,12 @@ class SimulatorManager:
         fp = len(set(detected) - set(actual))
         tn = benign_count - fp
         self.metrics.update_ids_matrix(tp, tn, fp, fn)
+        mc_trust_values = [float(self.bs.mc_trust[str(mc.mc_id)])
+                           for mc in self.mobile_chargers]
+        self.metrics.experiment_parameters.update({
+            'MC_Trust_Average_End': float(np.mean(mc_trust_values)) if mc_trust_values else 1.0,
+            'MC_Trust_Minimum_End': float(np.min(mc_trust_values)) if mc_trust_values else 1.0,
+        })
 
     def _trace_packet_path(self, source_id, seq_num, is_critical, payload_value):
         if not self.ablation.get('use_implicit_piggyback_telemetry', True):
@@ -2139,10 +2217,22 @@ class SimulatorManager:
             for idx in range(1, len(route)):
                 current_hop_id = route[idx]
                 if current_hop_id == self.BS_ID:
+                    sender_id = route[idx - 1]
+                    bs_distance = math.hypot(
+                        self.nodes[sender_id].x - self.nodes[self.BS_ID].x,
+                        self.nodes[sender_id].y - self.nodes[self.BS_ID].y)
+                    self._account_implicit_mac_ack(
+                        sender_id, self.BS_ID, bs_distance)
                     path_log.append(self.BS_ID)
                     break
                 hop_node = self.nodes[current_hop_id]
                 path_log.append(current_hop_id)
+                sender_id = route[idx - 1]
+                incoming_distance = math.hypot(
+                    self.nodes[sender_id].x - hop_node.x,
+                    self.nodes[sender_id].y - hop_node.y)
+                self._account_implicit_mac_ack(
+                    sender_id, current_hop_id, incoming_distance)
                 if hop_node.is_malicious:
                     packet_dropped = True
                     break

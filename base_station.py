@@ -8,7 +8,7 @@ import networkx as nx
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
-from config import compute_packet_hash, make_mc_mac, _source_energy, DATA_PACKET_BITS
+from config import compute_packet_hash, make_mc_mac, make_node_charge_receipt_mac, _source_energy, DATA_PACKET_BITS
 from routing import BaselineRouting
 from adaptive_charging import QuantumFuzzyChargingOracle, DynamicChargingDurationOracle
 
@@ -153,6 +153,11 @@ class BaseStation:
         self._last_shadow_signature = None
 
         self.mc_last_counter = defaultdict(lambda: -1)
+        self.mc_trust = defaultdict(lambda: 1.0)
+        self.mc_violation_count = defaultdict(int)
+        self.mc_consistent_report_streak = defaultdict(int)
+        self.node_receipt_last_counter = defaultdict(lambda: -1)
+        self.node_receipt_seen_nonces = defaultdict(lambda: deque(maxlen=2048))
         self.mc_seen_nonces = defaultdict(lambda: deque(
             maxlen=int(self.ablation.get('mc_nonce_cache_size', 2048))))
         self.sequence_replay_events = defaultdict(int)
@@ -1585,6 +1590,14 @@ class BaseStation:
                     print(
                         f"[WRSN SECURITY] Charge Hoarding detected at Node {nid}! Hard veto triggered.")
                     state['hard_veto'] = True
+                    state['hard_veto_reason'] = 'energy_report_mismatch'
+                    state['hard_veto_recoverable'] = True
+                    state['energy_probation'] = True
+                    state['energy_recovery_streak'] = 0
+                    state['energy_recovery_reference_energy'] = float(state.get('E_est', E_claimed_t))
+                    state['energy_recovery_reference_time'] = float(self._now())
+                    state['energy_recovery_last_epoch'] = None
+                    state['last_node_charge_receipt_consistent'] = False
                     state['status'] = 'BLACKLISTED'
                     state['FE'] = 0.0
                 elif (E_injected == 0 and delta_claimed > tolerance and
@@ -1600,6 +1613,14 @@ class BaseStation:
                         print(
                             f"[WRSN SECURITY] Confirmed fake-charger energy rise at Node {nid}.")
                         state['hard_veto'] = True
+                        state['hard_veto_reason'] = 'energy_report_mismatch'
+                        state['hard_veto_recoverable'] = True
+                        state['energy_probation'] = True
+                        state['energy_recovery_streak'] = 0
+                        state['energy_recovery_reference_energy'] = float(state.get('E_est', E_claimed_t))
+                        state['energy_recovery_reference_time'] = float(self._now())
+                        state['energy_recovery_last_epoch'] = None
+                        state['last_node_charge_receipt_consistent'] = False
                         state['status'] = 'BLACKLISTED'
                         state['FE'] = 0.0
                     else:
@@ -1847,10 +1868,56 @@ class BaseStation:
                 pass
         else:
             state.setdefault('energy_q_ewma', 0.0)
+        # Preserve the independent prediction before the claim overwrites E_est.
+        # Recovery must be based on this reference, not merely on accidental
+        # proximity between a forged constant claim and the physical battery.
+        prediction_before_update = float(state.get('E_est', reported_energy))
         state['energy_last_report_time'] = now
         state['energy_last_reported'] = reported_energy
         state['E_est'] = max(
             0.0, min(float(state.get('E_initial', reported_energy)), reported_energy))
+
+        if (self.ablation.get('enable_energy_trust_recovery', True)
+                and (state.get('energy_probation', False)
+                     or state.get('hard_veto_recoverable', False))):
+            E0 = max(float(state.get('E_initial', 1.0)), 1e-12)
+            tolerance = float(self.ablation.get(
+                'energy_trust_recovery_tolerance_ratio', 0.01)) * E0
+            min_t1 = float(self.ablation.get(
+                'energy_trust_recovery_min_auth_trust', 0.95))
+            min_t2 = float(self.ablation.get(
+                'energy_trust_recovery_min_forwarding_trust', 0.90))
+            t1 = float(state.get('T1_history', state.get('trust_vector', [1.0])[0]))
+            t2 = float(state.get('T2_history', state.get('trust_vector', [1.0, 1.0])[1]))
+
+            reference_energy = float(state.get(
+                'energy_recovery_reference_energy', prediction_before_update))
+            reference_time = float(state.get(
+                'energy_recovery_reference_time', now))
+            q_ref = max(0.0, float(state.get(
+                'physical_eps_ewma', state.get('energy_q_ewma', 0.0))))
+            reference_now = max(
+                0.0, reference_energy - q_ref * max(0.0, now - reference_time))
+
+            # A recovery is accepted only once per control epoch, requires
+            # trustworthy authentication/forwarding behaviour, agreement with
+            # an independent BS prediction, and at least one consistent signed
+            # charging receipt after the energy-mismatch incident. This blocks
+            # malicious constant low-energy claims from accidental recovery.
+            current_epoch = int(getattr(self, 'control_epoch_index', 0))
+            new_epoch = state.get('energy_recovery_last_epoch') != current_epoch
+            receipt_ok = state.get('last_node_charge_receipt_consistent') is True
+            prediction_ok = abs(reported_energy - reference_now) <= tolerance
+            eligible = bool(new_epoch and receipt_ok and prediction_ok
+                            and t1 >= min_t1 and t2 >= min_t2)
+            if eligible:
+                state['energy_recovery_last_epoch'] = current_epoch
+                state['energy_recovery_reference_energy'] = reported_energy
+                state['energy_recovery_reference_time'] = now
+                self._reward_truthful_energy_report(node_id)
+            elif new_epoch:
+                state['energy_recovery_last_epoch'] = current_epoch
+                state['energy_recovery_streak'] = 0
 
     def _estimate_energy_now(self, node_id, current_time=None):
         state = self.node_states.get(node_id)
@@ -2383,7 +2450,80 @@ class BaseStation:
                     node_id, current_t, validated=ok)
         return bool(ok)
 
-    def verify_charging_location(self, node_id, mc_x, mc_y, allowed_radius=None, charging_mode='contact', is_spoof_attempt=False):
+    def _penalize_mc_trust(self, mc_id, severity=0.25):
+        key = str(mc_id)
+        severity = float(np.clip(severity, 0.0, 1.0))
+        self.mc_violation_count[key] += 1
+        self.mc_consistent_report_streak[key] = 0
+        self.mc_trust[key] = max(0.0, float(self.mc_trust[key]) * (1.0 - severity))
+        return self.mc_trust[key]
+
+    def _reward_mc_trust(self, mc_id):
+        key = str(mc_id)
+        self.mc_consistent_report_streak[key] += 1
+        alpha = float(np.clip(self.ablation.get('mc_trust_recovery_alpha', 0.08), 0.0, 1.0))
+        current = float(self.mc_trust[key])
+        self.mc_trust[key] = min(1.0, current + alpha * (1.0 - current))
+        return self.mc_trust[key]
+
+    def _penalize_energy_report(self, node_id, reason, severity=0.5, hard=False):
+        state = self.node_states.get(node_id)
+        if state is None:
+            return
+        severity = float(np.clip(severity, 0.0, 1.0))
+        state['energy_violation_count'] = int(state.get('energy_violation_count', 0)) + 1
+        state['energy_recovery_streak'] = 0
+        state['energy_probation'] = True
+        state['last_energy_violation_reason'] = str(reason)
+        state['energy_recovery_reference_energy'] = float(state.get('E_est', 0.0))
+        state['energy_recovery_reference_time'] = float(self._now())
+        state['energy_recovery_last_epoch'] = None
+        state['last_node_charge_receipt_consistent'] = False
+        t5 = float(state.get('T5_history', 1.0))
+        t5 = max(0.0, t5 * (1.0 - severity))
+        state['T5_history'] = t5
+        state['trust_vector'][4] = t5
+        if hard:
+            state['hard_veto'] = True
+            state['hard_veto_reason'] = 'energy_report_mismatch'
+            state['hard_veto_recoverable'] = True
+            state['status'] = 'BLACKLISTED'
+            state['FE'] = 0.0
+        elif state.get('status') not in ('BLACKLISTED', 'QUARANTINE'):
+            state['status'] = 'WATCHLIST'
+
+    def _reward_truthful_energy_report(self, node_id):
+        state = self.node_states.get(node_id)
+        if state is None:
+            return
+        state['energy_recovery_streak'] = int(state.get('energy_recovery_streak', 0)) + 1
+        required = max(1, int(self.ablation.get('energy_trust_recovery_epochs', 8)))
+        alpha = float(np.clip(self.ablation.get('energy_trust_recovery_alpha', 0.12), 0.0, 1.0))
+        t5 = float(state.get('T5_history', 1.0))
+        t5 = min(1.0, t5 + alpha * (1.0 - t5))
+        state['T5_history'] = t5
+        state['trust_vector'][4] = t5
+        if (state.get('hard_veto_recoverable', False)
+                and state.get('hard_veto_reason') == 'energy_report_mismatch'
+                and state['energy_recovery_streak'] >= required):
+            state['hard_veto'] = False
+            state['hard_veto_recoverable'] = False
+            state['hard_veto_reason'] = None
+            state['energy_probation'] = False
+            state['energy_violation_count'] = 0
+            state['Deviation_MC'] = 0.0
+            state['Deviation_MC_norm'] = 0.0
+            state['status'] = 'WATCHLIST'
+            state['blacklist_counter'] = 0
+            self.metrics.energy_trust_recoveries += 1
+        elif (state.get('energy_probation', False)
+              and state['energy_recovery_streak'] >= required):
+            state['energy_probation'] = False
+            state['energy_violation_count'] = 0
+            if not state.get('hard_veto', False):
+                state['status'] = 'WHITELISTED'
+
+    def verify_charging_location(self, node_id, mc_x, mc_y, allowed_radius=None, charging_mode='contact', is_spoof_attempt=False, mc_id=None):
         self.metrics.mc_location_verification_checks += 1
         if is_spoof_attempt:
             self.metrics.mc_location_spoof_attempts += 1
@@ -2416,10 +2556,15 @@ class BaseStation:
             self.metrics.mc_location_verification_passes += 1
             if is_spoof_attempt:
                 self.metrics.mc_location_spoof_accepted += 1
+            if mc_id is not None:
+                self._reward_mc_trust(mc_id)
         else:
             self.metrics.mc_location_verification_failures += 1
+            self.metrics.mc_location_report_rejections += 1
             if is_spoof_attempt:
                 self.metrics.mc_location_spoof_detections += 1
+            if mc_id is not None:
+                self._penalize_mc_trust(mc_id, severity=0.40)
         return valid
 
     def _credit_accepted_mc_injection(self, node_id, injected_energy, timestamp=None):
@@ -2436,16 +2581,20 @@ class BaseStation:
         E0 = float(state.get('E_initial', 1.0))
         new_est = min(E0, float(state.get('E_est', 0.0)) + injected_energy)
         state['E_est'] = new_est
-        adaptive_credit = bool(self.use_adaptive_quantum_charging or
-                               self.ablation.get('use_adaptive_charge_guards', False) or
-                               self.ablation.get('use_dqn_charger_routing', False))
-        if adaptive_credit:
+        # Preserve the legacy operational estimator for direct comparability
+        # with previous experiments. Independent MC/node evidence is retained
+        # in separate audit fields and can be enforced with strict audit mode.
+        if self.ablation.get('preserve_legacy_mc_claim_credit', True):
             state['E_claimed'] = max(
                 float(state.get('E_claimed', 0.0)), new_est)
             state['legitimate_mc_credit_pending'] = True
-        state['energy_last_reported'] = max(
-            float(state.get('energy_last_reported', 0.0)), new_est)
-        state['energy_last_report_time'] = now
+            state['energy_last_reported'] = max(
+                float(state.get('energy_last_reported', 0.0)), new_est)
+            state['energy_last_report_time'] = now
+        state['pending_mc_audit_energy'] = float(
+            state.get('pending_mc_audit_energy', 0.0)) + injected_energy
+        state['pending_mc_expected_post_energy'] = new_est
+        state['pending_mc_audit_time'] = now
         state['charge_satisfied'] = (
             new_est / max(E0, 1e-12)) >= self.post_charge_release_ratio
         previous = self.last_charge_time_by_node[node_id]
@@ -2463,6 +2612,112 @@ class BaseStation:
             state.get('charge_audit_cycle', 0)) + 1
         self.last_charged_energy_ratio_by_node[node_id] = new_est / max(
             E0, 1e-12)
+
+    def report_node_charge_receipt(self, receipt, expected_injected_energy=None, mc_report_accepted=None):
+        """Verify and reconcile an independently signed sensor charging receipt."""
+        if not isinstance(receipt, dict):
+            self.metrics.node_charge_receipt_auth_failures += 1
+            return False
+        try:
+            node_id = int(receipt.get('node_id'))
+            before = float(receipt.get('energy_before'))
+            after = float(receipt.get('energy_after'))
+            claimed_received = float(receipt.get('claimed_received'))
+            mc_id = receipt.get('mc_id')
+            counter = int(receipt.get('counter'))
+            nonce = str(receipt.get('nonce'))
+            timestamp = float(receipt.get('timestamp'))
+            supplied = receipt.get('mac_tag')
+        except (TypeError, ValueError):
+            self.metrics.node_charge_receipt_auth_failures += 1
+            return False
+        state = self.node_states.get(node_id)
+        if state is None:
+            self.metrics.node_charge_receipt_auth_failures += 1
+            return False
+        key = state.get('crypto_keys')
+        expected = make_node_charge_receipt_mac(
+            key, node_id, before, after, claimed_received, mc_id=mc_id,
+            counter=counter, nonce=nonce, timestamp=timestamp)
+        replay = (counter <= self.node_receipt_last_counter[node_id]
+                  or nonce in self.node_receipt_seen_nonces[node_id])
+        if replay or expected is None or supplied is None or not hmac.compare_digest(str(supplied), str(expected)):
+            self.metrics.node_charge_receipt_auth_failures += 1
+            return False
+
+        self.node_receipt_last_counter[node_id] = counter
+        self.node_receipt_seen_nonces[node_id].append(nonce)
+        self.metrics.node_charge_receipts_received += 1
+
+        E0 = max(float(state.get('E_initial', 1.0)), 1e-12)
+        credited_mc_energy = max(0.0, float(state.get('pending_mc_audit_energy', 0.0)))
+        expected_energy = (
+            credited_mc_energy if expected_injected_energy is None
+            else max(0.0, float(expected_injected_energy)))
+        expected_post = float(state.get('pending_mc_expected_post_energy', state.get('E_est', after)))
+        physical_node = self.network_nodes.get(node_id)
+        trusted_post = (
+            float(getattr(physical_node, 'E_current', expected_post))
+            if physical_node is not None else expected_post)
+        observed_delta = max(0.0, after - before)
+        tolerance = max(
+            float(self.ablation.get('charge_receipt_absolute_tolerance_j', 1e-9)),
+            float(self.ablation.get('charge_receipt_tolerance_ratio', 0.05)) * E0)
+        consistent = bool(
+            -tolerance <= before <= E0 + tolerance
+            and -tolerance <= after <= E0 + tolerance
+            and abs(claimed_received - expected_energy) <= tolerance
+            and after <= before + claimed_received + tolerance
+            and abs(after - trusted_post) <= tolerance)
+
+        state['last_node_charge_receipt_consistent'] = consistent
+        state['last_node_charge_receipt_mc_id'] = mc_id
+        state['last_node_charge_receipt_time'] = timestamp
+        state['last_node_charge_receipt_delta'] = observed_delta
+        state['last_node_charge_receipt_claimed'] = claimed_received
+        state['pending_mc_audit_energy'] = 0.0
+        state['pending_mc_expected_post_energy'] = after if consistent else expected_post
+
+        enforcement = str(self.ablation.get(
+            'charging_audit_enforcement_mode', 'shadow')).strip().lower()
+        strict = enforcement in {'strict', 'enforce', 'operational'}
+        audit_trust = float(state.get('energy_audit_trust', 1.0))
+
+        if consistent:
+            self.metrics.node_charge_receipts_consistent += 1
+            state['energy_audit_recovery_streak'] = int(
+                state.get('energy_audit_recovery_streak', 0)) + 1
+            audit_alpha = float(np.clip(self.ablation.get(
+                'energy_audit_trust_recovery_alpha', 0.15), 0.0, 1.0))
+            state['energy_audit_trust'] = min(
+                1.0, audit_trust + audit_alpha * (1.0 - audit_trust))
+            if strict:
+                was_rehabilitating = bool(
+                    state.get('energy_probation', False)
+                    or state.get('hard_veto_recoverable', False))
+                state['E_claimed'] = max(0.0, min(E0, after))
+                self._observe_energy_report(node_id, state['E_claimed'], timestamp)
+                state['legitimate_mc_credit_pending'] = bool(
+                    mc_report_accepted is not False)
+                if not was_rehabilitating:
+                    self._reward_truthful_energy_report(node_id)
+            if mc_id is not None:
+                self._reward_mc_trust(mc_id)
+        else:
+            self.metrics.node_charge_receipts_inconsistent += 1
+            state['energy_audit_recovery_streak'] = 0
+            severe = (abs(claimed_received - expected_energy) > 2.0 * tolerance
+                      or abs(after - trusted_post) > 2.0 * tolerance)
+            state['energy_audit_trust'] = max(
+                0.0, audit_trust * (0.45 if severe else 0.75))
+            state['energy_audit_probation'] = True
+            if strict:
+                state['E_claimed'] = max(0.0, min(E0, after))
+                self._observe_energy_report(node_id, state['E_claimed'], timestamp)
+                self._penalize_energy_report(
+                    node_id, 'node_charge_receipt_mismatch',
+                    severity=0.55 if severe else 0.25, hard=severe)
+        return consistent
 
     def is_deadline_rescue_node(self, node_id, current_time=None):
         """
@@ -2489,56 +2744,92 @@ class BaseStation:
         # OR its energy ratio has dropped below the critical threshold.
         return bool(ttd <= hard_margin or (e_est / e_initial) <= critical_ratio)
 
-    def report_mc_injection_oob(self, node_id, injected_energy, mc_x=None, mc_y=None, mac_tag=None, mc_id=None, counter=None, nonce=None, timestamp=None):
+    def report_mc_injection_oob(self, node_id, injected_energy, mc_x=None, mc_y=None, mac_tag=None, mc_id=None, counter=None, nonce=None, timestamp=None, *, charging_mode='contact', allowed_radius=None, expected_injected_energy=None, is_spoof_attempt=False):
+        """Authenticate, localize, and reconcile an MC charging report.
+
+        Physical charging has already occurred. Rejection prevents the claim
+        from being credited in BS accounting and reduces MC trust; it does not
+        attempt to remove energy already delivered to the sensor.
+        """
         auth_enabled = self.ablation.get('use_mc_hmac_authentication', True)
         if node_id not in self.node_states:
             return False
 
-        if not auth_enabled:
-            fake_or_missing = (mac_tag is None or mc_x is None or mc_y is None)
-            if fake_or_missing:
-                self.metrics.mc_fake_reports_attempted += 1
-            self._credit_accepted_mc_injection(
-                node_id, injected_energy, timestamp=timestamp)
-            if fake_or_missing:
-                self.metrics.mc_fake_reports_accepted += 1
-            return True
-
+        fake_or_missing = (mac_tag is None or mc_x is None or mc_y is None)
         shared_key = getattr(self, 'mc_shared_key', None)
         if mc_id is not None:
-            shared_key = getattr(self, 'mc_shared_keys', {}).get(
-                str(mc_id), shared_key)
-        required_missing = (
-            shared_key is None or mac_tag is None or mc_x is None or mc_y is None or
-            mc_id is None or counter is None or nonce is None or timestamp is None
-        )
-        if required_missing:
+            shared_key = getattr(self, 'mc_shared_keys', {}).get(str(mc_id), shared_key)
+
+        if auth_enabled:
+            required_missing = (
+                shared_key is None or mac_tag is None or mc_x is None or mc_y is None or
+                mc_id is None or counter is None or nonce is None or timestamp is None)
+            if required_missing:
+                self.metrics.mc_fake_reports_attempted += 1
+                self.metrics.mc_rejected_unauth_reports += 1
+                self.mc_fail_closed_rejections += 1
+                if mc_id is not None:
+                    self._penalize_mc_trust(mc_id, severity=0.50)
+                return False
+
+            counter = int(counter)
+            nonce = str(nonce)
+            mc_key = str(mc_id)
+            if counter <= self.mc_last_counter[mc_key] or nonce in self.mc_seen_nonces[mc_key]:
+                self.metrics.mc_fake_reports_attempted += 1
+                self.metrics.mc_rejected_unauth_reports += 1
+                self.metrics.mc_replay_rejections += 1
+                self.mc_replay_rejections += 1
+                self._penalize_mc_trust(mc_id, severity=0.35)
+                return False
+
+            expected_tag = make_mc_mac(
+                shared_key, node_id, injected_energy, mc_x, mc_y,
+                mc_id=mc_id, counter=counter, nonce=nonce, timestamp=timestamp)
+            if expected_tag is None or not hmac.compare_digest(str(mac_tag), str(expected_tag)):
+                self.metrics.mc_fake_reports_attempted += 1
+                self.metrics.mc_rejected_unauth_reports += 1
+                self._penalize_mc_trust(mc_id, severity=0.50)
+                return False
+
+            # An authenticated but physically invalid report is still consumed
+            # by the anti-replay state before its location/energy claim is rejected.
+            self.mc_last_counter[mc_key] = counter
+            self.mc_seen_nonces[mc_key].append(nonce)
+        elif fake_or_missing:
             self.metrics.mc_fake_reports_attempted += 1
-            self.metrics.mc_rejected_unauth_reports += 1
-            self.mc_fail_closed_rejections += 1
+
+        if mc_x is None or mc_y is None:
+            self.metrics.mc_location_verification_checks += 1
+            self.metrics.mc_location_verification_failures += 1
+            self.metrics.mc_location_report_rejections += 1
+            if mc_id is not None:
+                self._penalize_mc_trust(mc_id, severity=0.40)
             return False
 
-        counter = int(counter)
-        nonce = str(nonce)
-        mc_key = str(mc_id)
-        if counter <= self.mc_last_counter[mc_key] or nonce in self.mc_seen_nonces[mc_key]:
-            self.metrics.mc_fake_reports_attempted += 1
-            self.metrics.mc_rejected_unauth_reports += 1
-            self.metrics.mc_replay_rejections += 1
-            self.mc_replay_rejections += 1
+        if not self.verify_charging_location(
+                node_id, mc_x, mc_y, allowed_radius=allowed_radius,
+                charging_mode=charging_mode, is_spoof_attempt=is_spoof_attempt,
+                mc_id=mc_id):
             return False
 
-        expected_tag = make_mc_mac(shared_key, node_id, injected_energy, mc_x,
-                                   mc_y, mc_id=mc_id, counter=counter, nonce=nonce, timestamp=timestamp)
-        if expected_tag is None or not hmac.compare_digest(str(mac_tag), str(expected_tag)):
-            self.metrics.mc_fake_reports_attempted += 1
-            self.metrics.mc_rejected_unauth_reports += 1
-            return False
+        E0 = max(float(self.node_states[node_id].get('E_initial', 1.0)), 1e-12)
+        if expected_injected_energy is not None:
+            deviation = abs(float(injected_energy) - float(expected_injected_energy))
+            tolerance = max(
+                float(self.ablation.get('mc_energy_claim_absolute_tolerance_j', 1e-9)),
+                float(self.ablation.get('mc_energy_claim_tolerance_ratio', 0.05)) * E0)
+            if deviation > tolerance:
+                self.metrics.mc_energy_claim_mismatches += 1
+                if mc_id is not None:
+                    self._penalize_mc_trust(mc_id, severity=0.45)
+                return False
 
-        self.mc_last_counter[mc_key] = counter
-        self.mc_seen_nonces[mc_key].append(nonce)
-        self._credit_accepted_mc_injection(
-            node_id, injected_energy, timestamp=timestamp)
+        self._credit_accepted_mc_injection(node_id, injected_energy, timestamp=timestamp)
+        if mc_id is not None:
+            self._reward_mc_trust(mc_id)
+        if not auth_enabled and fake_or_missing:
+            self.metrics.mc_fake_reports_accepted += 1
         return True
 
     def trigger_incident_response(self, victim_id, spoof_x, spoof_y):

@@ -176,6 +176,21 @@ def _base_config():
         'max_mobile_chargers': 8,
 
         'enable_network_layer_ack': False,
+        # MAC ACK is always accounted as a hardware link-layer cost. The
+        # default accounting mode preserves legacy battery trajectories; use
+        # 'strict_physical' for an additional physical battery deduction.
+        'implicit_mac_ack_mode': 'accounting',
+        'ack_packet_bits': 16 * 8,
+        'charge_receipt_tolerance_ratio': 0.05,
+        'mc_energy_claim_tolerance_ratio': 0.05,
+        'enable_energy_trust_recovery': True,
+        'energy_trust_recovery_epochs': 8,
+        'energy_trust_recovery_alpha': 0.12,
+        'energy_trust_recovery_tolerance_ratio': 0.01,
+        'energy_trust_recovery_min_auth_trust': 0.95,
+        'energy_trust_recovery_min_forwarding_trust': 0.90,
+        'charging_audit_enforcement_mode': 'shadow',
+        'preserve_legacy_mc_claim_credit': True,
         'enable_periodic_hello': False,
         'route_recompute_period': None,
         'data_packet_bits': DATA_PACKET_BITS,
@@ -891,15 +906,19 @@ def run_innovation_coverage_validation(output_csv='phase1_innovation_coverage_va
         1, 0.2, mc_x=0.0, mc_y=0.0, mac_tag=good_tag, mc_id='MC-1', counter=2, nonce='n-good', timestamp=2.0)
     replay = bs.report_mc_injection_oob(
         1, 0.2, mc_x=0.0, mc_y=0.0, mac_tag=good_tag, mc_id='MC-1', counter=2, nonce='n-good', timestamp=2.0)
-    bs.verify_charging_location(
-        1, mc_x=999.0, mc_y=999.0, is_spoof_attempt=True)
+    off_tag = make_mc_mac('mc-key', 1, 0.2, 999.0, 999.0,
+                          mc_id='MC-1', counter=3, nonce='n-off', timestamp=3.0)
+    off_location = bs.report_mc_injection_oob(
+        1, 0.2, mc_x=999.0, mc_y=999.0, mac_tag=off_tag,
+        mc_id='MC-1', counter=3, nonce='n-off', timestamp=3.0,
+        is_spoof_attempt=True)
     bs.node_states[1]['E_est'] = 0.2
     bs.node_states[1]['E_claimed'] = 0.9
     raw_ok = bs.validate_charging_request(1, emergency=True)
     s = metrics.export_summary(1, 'InnovationAudit_MCSecurity', 10)
     rows.append(_innovation_audit_row(
         'MC_HMAC_Replay_Location_Spoof_and_Raw_SOS_Blocking',
-        (not forged) and ok1 and (not replay) and (
+        (not forged) and ok1 and (not replay) and (not off_location) and (
             not raw_ok) and s['Location_Spoof_Rejection_Rate'] == 1.0,
         'Forged MC report rejected, valid report accepted once, replay rejected, off-location report rejected, inconsistent raw SOS blocked.',
         f"forged_rejection={s['Forged_MC_Report_Rejection_Rate']:.3f}, replay_rejection={s['MC_Replay_Rejection_Rate']:.3f}, location_rejection={s['Location_Spoof_Rejection_Rate']:.3f}, raw_sos_block={s['Raw_SOS_Blocking_Rate']:.3f}", s))

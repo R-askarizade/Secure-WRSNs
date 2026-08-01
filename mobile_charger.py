@@ -267,6 +267,10 @@ class MobileCharger:
                                   float(node.E_current))
                 for node in plan["nodes"]
             },
+            "energy_at_start": {
+                node.node_id: max(0.0, float(node.E_current))
+                for node in plan["nodes"]
+            },
             "mc_energy_spent": 0.0,
             "finalized": False,
         }
@@ -341,10 +345,6 @@ class MobileCharger:
                 if is_cluster else
                 float(self.bs.ablation.get("contact_location_tolerance_m", 5.0))
             )
-            self.bs.verify_charging_location(
-                node_id, self.x, self.y, allowed_radius=allowed_radius,
-                charging_mode=("rf_cluster" if is_cluster else "contact"),
-                is_spoof_attempt=False)
 
             self.report_counter += 1
             nonce = secrets.token_hex(12)
@@ -352,14 +352,31 @@ class MobileCharger:
                 self.crypto_keys, node_id, actual_injected, self.x, self.y,
                 mc_id=self.mc_id, counter=self.report_counter,
                 nonce=nonce, timestamp=now)
+            expected_injected = min(
+                float(session["allocations"].get(node_id, 0.0)),
+                power * float(session["elapsed"]),
+                initial_missing)
             accepted = self.bs.report_mc_injection_oob(
                 node_id, actual_injected, self.x, self.y, mac_tag,
                 mc_id=self.mc_id, counter=self.report_counter,
-                nonce=nonce, timestamp=now)
+                nonce=nonce, timestamp=now,
+                charging_mode=("rf_cluster" if is_cluster else "contact"),
+                allowed_radius=allowed_radius,
+                expected_injected_energy=expected_injected)
             if not accepted:
                 print(
                     f"[MC AUTH] Charging report from MC {self.mc_id} "
                     f"for Node {node_id} was rejected by BS.")
+
+            receipt = node.create_charge_receipt(
+                energy_before=float(session["energy_at_start"].get(
+                    node_id, max(0.0, float(node.E_current) - actual_injected))),
+                energy_after=float(node.E_current),
+                received_energy=actual_injected,
+                mc_id=self.mc_id, timestamp=now)
+            receipt_consistent = self.bs.report_node_charge_receipt(
+                receipt, expected_injected_energy=expected_injected,
+                mc_report_accepted=accepted)
 
             recorded_time = float(
                 session["elapsed"]) if charged_node_count == 1 else 0.0
@@ -372,6 +389,8 @@ class MobileCharger:
                 "effective_duration": actual_injected / max(power, 1e-12),
                 "distance_to_stop": self._calculate_distance(
                     self.x, self.y, node.x, node.y),
+                "mc_report_accepted": bool(accepted),
+                "node_receipt_consistent": bool(receipt_consistent),
             }
 
         if is_cluster and charged_node_count > 0:

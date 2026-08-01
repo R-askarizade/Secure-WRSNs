@@ -1,7 +1,7 @@
 import math
 import time
 import random
-from config import compute_packet_hash, CONTROL_PACKET_BYTES_SMALL, DATA_PACKET_BYTES
+from config import compute_packet_hash, make_node_charge_receipt_mac, CONTROL_PACKET_BYTES_SMALL, DATA_PACKET_BYTES
 
 
 class SensorNode:
@@ -51,6 +51,7 @@ class SensorNode:
         self.is_malicious = False
         self.sos_sent = False
         self.control_seq_counter = 0
+        self.charge_receipt_counter = 0
 
         self.E_elec = max(0.0, float(radio_e_elec_j_per_bit))
         self.eps_fs = max(0.0, float(radio_eps_fs_j_per_bit_m2))
@@ -326,6 +327,41 @@ class SensorNode:
                     self.node_id, self.metrics.current_sim_time)
         self.sos_sent = False
         return actual
+
+    def create_charge_receipt(self, energy_before, energy_after, received_energy, mc_id, timestamp):
+        """Create an independently authenticated sensor-side charging receipt.
+
+        The receipt is carried by the existing charging handshake and therefore
+        does not create a separate network-layer packet or alter legacy energy/
+        overhead results. A malicious sensor retains its configured false-energy
+        behavior, allowing the BS to distinguish MC and sensor claims.
+        """
+        self.charge_receipt_counter += 1
+        counter = int(self.charge_receipt_counter)
+        nonce = f"node-{int(self.node_id)}-{counter}-{float(timestamp):.6f}"
+        before = max(0.0, float(energy_before))
+        physical_after = max(0.0, float(energy_after))
+        reported_after = physical_after
+        if self.is_malicious:
+            reported_after = max(0.0, float(self.E_max) * 0.05)
+        claimed_received = max(0.0, float(received_energy))
+        if self.is_malicious:
+            claimed_received = max(0.0, reported_after - before)
+        tag = make_node_charge_receipt_mac(
+            self.crypto_keys, self.node_id, before, reported_after,
+            claimed_received, mc_id=mc_id, counter=counter,
+            nonce=nonce, timestamp=timestamp)
+        return {
+            'node_id': int(self.node_id),
+            'energy_before': before,
+            'energy_after': reported_after,
+            'claimed_received': claimed_received,
+            'mc_id': mc_id,
+            'counter': counter,
+            'nonce': nonce,
+            'timestamp': float(timestamp),
+            'mac_tag': tag,
+        }
 
     def receive_fixed_charge(self, injected_energy):
         return self.receive_wireless_charge(injected_energy)

@@ -79,6 +79,22 @@ class MetricsCollector:
         self.source_sequence_replay_events = 0
         self.packet_hmac_failures = 0
 
+        # Implicit hardware MAC-ACK accounting. In the default non-regression
+        # mode the cost is measured but not double-deducted from the legacy
+        # aggregate radio-energy envelope.
+        self.implicit_mac_ack_transactions = 0
+        self.implicit_mac_ack_energy = 0.0
+        self.implicit_mac_ack_physically_deducted_energy = 0.0
+
+        # Independent charging-audit evidence.
+        self.node_charge_receipts_received = 0
+        self.node_charge_receipts_consistent = 0
+        self.node_charge_receipts_inconsistent = 0
+        self.node_charge_receipt_auth_failures = 0
+        self.mc_energy_claim_mismatches = 0
+        self.mc_location_report_rejections = 0
+        self.energy_trust_recoveries = 0
+
         # INNOVATION AUDIT METRICS
         self.charging_decision_tp = 0
         self.charging_decision_fp = 0
@@ -275,6 +291,13 @@ class MetricsCollector:
             self.rf_total_delivered_energy += delivered_energy
         else:
             self.mc_contact_charging_energy += energy_spent
+
+    def record_implicit_mac_ack(self, energy_j, physically_deducted=False):
+        energy_j = max(0.0, float(energy_j))
+        self.implicit_mac_ack_transactions += 1
+        self.implicit_mac_ack_energy += energy_j
+        if physically_deducted:
+            self.implicit_mac_ack_physically_deducted_energy += energy_j
 
     def record_execution_time(self, component, exec_time_ms):
         if component == 'EDGE':
@@ -536,6 +559,16 @@ class MetricsCollector:
             'MC_TPM_Zeroized_Events': self.mc_tpm_zeroized_events,
             'Source_Sequence_Replay_Events': self.source_sequence_replay_events,
             'Packet_HMAC_Failures': self.packet_hmac_failures,
+            'Implicit_MAC_ACK_Transactions': self.implicit_mac_ack_transactions,
+            'Implicit_MAC_ACK_Energy_J': self.implicit_mac_ack_energy,
+            'Implicit_MAC_ACK_Physically_Deducted_Energy_J': self.implicit_mac_ack_physically_deducted_energy,
+            'Node_Charge_Receipts_Received': self.node_charge_receipts_received,
+            'Node_Charge_Receipts_Consistent': self.node_charge_receipts_consistent,
+            'Node_Charge_Receipts_Inconsistent': self.node_charge_receipts_inconsistent,
+            'Node_Charge_Receipt_Auth_Failures': self.node_charge_receipt_auth_failures,
+            'MC_Energy_Claim_Mismatches': self.mc_energy_claim_mismatches,
+            'MC_Location_Report_Rejections': self.mc_location_report_rejections,
+            'Energy_Trust_Recoveries': self.energy_trust_recoveries,
             'Adaptive_K_opt_Avg': float(np.mean(self.adaptive_k_opts)) if self.adaptive_k_opts else 0.0,
         }
 

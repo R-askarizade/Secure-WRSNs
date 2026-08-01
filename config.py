@@ -65,6 +65,24 @@ def make_mc_mac(shared_key, node_id, injected_energy, mc_x, mc_y, mc_id=None, co
     return hmac.new(str(shared_key).encode("utf-8"), _canonical_json(msg), hashlib.sha256).hexdigest()
 
 
+def make_node_charge_receipt_mac(key, node_id, energy_before, energy_after, claimed_received, mc_id=None, counter=None, nonce=None, timestamp=None):
+    """Authenticate the sensor-side charging receipt independently of the MC report."""
+    if key is None:
+        return None
+    msg = {
+        "domain": "WRSN_NODE_CHARGE_RECEIPT_V1",
+        "node_id": int(node_id),
+        "energy_before": round(float(energy_before), 9),
+        "energy_after": round(float(energy_after), 9),
+        "claimed_received": round(float(claimed_received), 9),
+        "mc_id": mc_id,
+        "counter": None if counter is None else int(counter),
+        "nonce": nonce,
+        "timestamp": None if timestamp is None else round(float(timestamp), 6),
+    }
+    return hmac.new(str(key).encode("utf-8"), _canonical_json(msg), hashlib.sha256).hexdigest()
+
+
 def _ci95(series):
     arr = pd.to_numeric(pd.Series(series),
                         errors='coerce').dropna().to_numpy(dtype=float)
