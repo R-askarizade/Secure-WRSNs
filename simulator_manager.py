@@ -138,6 +138,20 @@ class SimulatorManager:
             'Adaptive_Training_Mode': 'online_warmup_and_safety_shielded',
             'Charging_Audit_Enforcement_Mode': str(self.ablation.get('charging_audit_enforcement_mode', 'shadow')),
             'Legacy_MC_Claim_Credit_Preserved_Flag': bool(self.ablation.get('preserve_legacy_mc_claim_credit', True)),
+            'Attack_Model_Mode': str(self.ablation.get('attack_model_mode', 'legacy_compatible')),
+            'Attack_Data_Drop_Probability': float(self.ablation.get('attack_data_drop_probability', 1.0)),
+            'Attack_Control_Drop_Probability': float(self.ablation.get('attack_control_drop_probability', 0.50)),
+            'Attack_False_Energy_Data_Enabled_Flag': bool(self.ablation.get('attack_false_energy_data_enabled', False)),
+            'Attack_False_Energy_Receipt_Enabled_Flag': bool(self.ablation.get('attack_false_energy_receipt_enabled', True)),
+            'Attack_False_SOS_Mode': str(self.ablation.get('attack_false_sos_mode', 'legacy_compatible')),
+            'Attack_Delay_Enabled_Flag': bool(self.ablation.get('attack_delay_enabled', False)),
+            'Attack_Tamper_Enabled_Flag': bool(self.ablation.get('attack_tamper_enabled', False)),
+            'Attack_Replay_Enabled_Flag': bool(self.ablation.get('attack_replay_enabled', False)),
+            'Attack_On_Off_Enabled_Flag': bool(self.ablation.get('attack_on_off_enabled', False)),
+            'Attack_Remediation_Time_s': self.ablation.get(
+                'attack_remediation_time_s', None),
+            'Attack_Rehabilitation_Delay_s': self.ablation.get(
+                'attack_rehabilitation_delay_s', 10.0),
         })
 
         # Reference control/charging routing remains the original method.
@@ -479,7 +493,9 @@ class SimulatorManager:
             charger = MobileCharger(
                 mc_id=id_start + idx, depot_x=bs_x, depot_y=bs_y,
                 capacity=capacities[idx], speed=speeds[idx],
-                base_station=self.bs, metrics_collector=self.metrics)
+                base_station=self.bs, metrics_collector=self.metrics,
+                attack_config=self.ablation,
+                rng_seed=int(self.seed) * 2_000_003 + idx)
             charger.travel_energy_cost_per_m = float(travel_costs[idx])
             charger.charging_rate = float(
                 self.ablation.get('charging_rate', 5.0))
@@ -502,14 +518,16 @@ class SimulatorManager:
         }
         self.nodes[self.BS_ID] = SensorNode(
             self.BS_ID, bs_x, bs_y, float('inf'), self.metrics,
-            rng_seed=int(self.seed) * 1_000_003, **node_radio_kwargs)
+            rng_seed=int(self.seed) * 1_000_003,
+            attack_config=self.ablation, **node_radio_kwargs)
         initial_energy = float(self.sensor_initial_energy)
         for i in range(1, self.num_nodes + 1):
             x = self.topology_rng.uniform(0, self.network_size[0])
             y = self.topology_rng.uniform(0, self.network_size[1])
             self.nodes[i] = SensorNode(
                 i, x, y, initial_energy, self.metrics,
-                rng_seed=int(self.seed) * 1_000_003 + i, **node_radio_kwargs)
+                rng_seed=int(self.seed) * 1_000_003 + i,
+                attack_config=self.ablation, **node_radio_kwargs)
 
         self.bs.network_nodes = self.nodes
         self.bs.mc_reference = self.mc
@@ -1902,9 +1920,35 @@ class SimulatorManager:
         self.malicious_nodes = self.attack_rng.sample(
             alive_node_ids, num_attackers)
         for nid in self.malicious_nodes:
-            self.nodes[nid].is_malicious = True
+            self.nodes[nid].set_malicious(True)
         print(
             f"[ATTACK INJECTION] {num_attackers} malicious nodes injected into the network.")
+
+    def _maybe_inject_fake_charger_attack(self):
+        """Physically raise one sensor's energy without an authenticated MC report.
+
+        The rise is later reported by the normal SensorNode DATA/control path,
+        allowing the BS zero-overhead energy audit to detect it end-to-end.
+        This is disabled in the non-regression baseline.
+        """
+        if not self.ablation.get('fake_charger_attack_enabled', False):
+            return None
+        probability = max(0.0, min(1.0, float(self.ablation.get(
+            'fake_charger_attack_probability_per_epoch', 0.0))))
+        if self.attack_rng.random() >= probability:
+            return None
+        candidates = [
+            node for nid, node in self.nodes.items()
+            if nid != self.BS_ID and node.status == 'ALIVE'
+            and nid not in self.bs.fixed_charger_nodes
+        ]
+        if not candidates:
+            return None
+        node = self.attack_rng.choice(candidates)
+        ratio = max(0.0, float(self.ablation.get(
+            'fake_charger_attack_energy_ratio', 0.35)))
+        injected = node.receive_wireless_charge(float(node.E_max) * ratio)
+        return (node.node_id, injected)
 
     def _account_implicit_mac_ack(self, sender_id, receiver_id, distance):
         """Account a hardware MAC ACK without creating a network packet.
@@ -1962,6 +2006,7 @@ class SimulatorManager:
 
                 packet_dropped = False
                 path_log = [source_id]
+                malicious_delay_s = 0.0
 
                 for idx in range(1, len(route)):
                     current_hop_id = route[idx]
@@ -1999,10 +2044,12 @@ class SimulatorManager:
                     if not success:
                         packet_dropped = True
                         break
+                    malicious_delay_s += hop_node.attack_delay_seconds(
+                        self.current_time)
 
                 if not packet_dropped and path_log[-1] == self.BS_ID:
                     pkt['path_header'] = path_log
-                    delay = len(path_log) * 0.100
+                    delay = len(path_log) * 0.100 + malicious_delay_s
                     self.bs.data_plane_receive(
                         pkt, path_log, self.current_time + delay)
 
@@ -2032,6 +2079,24 @@ class SimulatorManager:
         tpm_attack_time = self.tpm_rng.uniform(
             self.sim_time * 0.3, self.sim_time * 0.7)
         tpm_attack_triggered = False
+        remediation_applied = False
+        rehabilitation_applied = False
+        remediation_time_raw = self.ablation.get(
+            'attack_remediation_time_s', None)
+        remediation_time = (
+            None if remediation_time_raw in (None, '')
+            else max(0.0, float(remediation_time_raw))
+        )
+        rehabilitation_delay_raw = self.ablation.get(
+            'attack_rehabilitation_delay_s', self.bs.T_epoch)
+        rehabilitation_delay = (
+            None if rehabilitation_delay_raw in (None, '')
+            else max(0.0, float(rehabilitation_delay_raw))
+        )
+        rehabilitation_time = (
+            None if remediation_time is None or rehabilitation_delay is None
+            else remediation_time + rehabilitation_delay
+        )
 
         while self.current_time < self.sim_time - 1e-12:
             next_mc_time = self._next_charger_event_time()
@@ -2039,10 +2104,19 @@ class SimulatorManager:
                 tpm_attack_time
                 if self.physical_compromise_experiment_active and not tpm_attack_triggered
                 else float('inf'))
+            next_remediation_time = (
+                float(remediation_time)
+                if remediation_time is not None and not remediation_applied
+                else float('inf'))
+            next_rehabilitation_time = (
+                float(rehabilitation_time)
+                if rehabilitation_time is not None and not rehabilitation_applied
+                else float('inf'))
             next_time = min(
                 float(next_event_time), float(next_epoch_time),
                 float(next_energy_record_time), float(next_mc_time),
-                float(next_tpm_time), float(self.sim_time))
+                float(next_tpm_time), float(next_remediation_time),
+                float(next_rehabilitation_time), float(self.sim_time))
             if not math.isfinite(next_time):
                 break
 
@@ -2055,6 +2129,19 @@ class SimulatorManager:
                 tpm_attack_triggered = True
 
             self._process_due_charger_events()
+
+            if (not remediation_applied and remediation_time is not None
+                    and self.current_time + 1e-9 >= remediation_time):
+                for nid in self.malicious_nodes:
+                    self.nodes[nid].remediate(self.current_time)
+                remediation_applied = True
+
+            if (remediation_applied and not rehabilitation_applied
+                    and rehabilitation_time is not None
+                    and self.current_time + 1e-9 >= rehabilitation_time):
+                for nid in self.malicious_nodes:
+                    self.nodes[nid].complete_rehabilitation(self.current_time)
+                rehabilitation_applied = True
 
             processed_network_event = False
             if next_event_time <= self.current_time + 1e-9:
@@ -2072,16 +2159,19 @@ class SimulatorManager:
                     raw_data = 80.0 if is_critical_event else 25.0
                     packet_seq_num += 1
                     method_is_critical = raw_data > active_node.adaptive_threshold
-                    active_node.sense_environment(raw_data, self.current_time)
+                    source_packet = active_node.sense_environment(
+                        raw_data, self.current_time)
                     self._trace_packet_path(
                         active_node_id, packet_seq_num,
-                        method_is_critical, raw_data)
+                        method_is_critical, raw_data,
+                        source_packet=source_packet)
                 next_event_time += self.event_rng.expovariate(event_rate)
 
             if next_epoch_time <= self.current_time + 1e-9:
                 processed_network_event = True
                 if self.active_charger_missions:
                     self.metrics.mc_network_events_while_busy += 1
+                self._maybe_inject_fake_charger_attack()
                 self.bs.control_plane_epoch()
                 self._push_updated_routes()
                 next_epoch_time += float(self.bs.T_epoch)
@@ -2129,7 +2219,9 @@ class SimulatorManager:
             'MC_Trust_Minimum_End': float(np.min(mc_trust_values)) if mc_trust_values else 1.0,
         })
 
-    def _trace_packet_path(self, source_id, seq_num, is_critical, payload_value):
+    def _trace_packet_path(self, source_id, seq_num, is_critical, payload_value,
+                           source_packet=None, seq_override=None,
+                           count_generated=True, allow_source_replay=True):
         if not self.ablation.get('use_implicit_piggyback_telemetry', True):
             self.metrics.update_packet_transmission(
                 is_critical=False, is_control=True, size_bytes=self.control_packet_bytes, size_bits=self.control_packet_bits, overhead_phase='operational')
@@ -2137,11 +2229,14 @@ class SimulatorManager:
             self.metrics.update_packet_transmission(
                 is_critical=False, is_control=True, size_bytes=self.control_packet_bytes, size_bits=self.control_packet_bits, overhead_phase='operational')
 
-        self.source_seq_counters[source_id] += 1
-        seq_num = self.source_seq_counters[source_id]
+        if seq_override is None:
+            self.source_seq_counters[source_id] += 1
+            seq_num = self.source_seq_counters[source_id]
+        else:
+            seq_num = int(seq_override)
         key = (int(source_id), int(seq_num))
 
-        if key not in self.metrics._unique_generated_data_keys:
+        if count_generated and key not in self.metrics._unique_generated_data_keys:
             self.metrics._unique_generated_data_keys.add(key)
             self.metrics.update_packet_transmission(
                 is_critical=bool(is_critical), is_control=False, size_bytes=self.data_packet_bytes,
@@ -2187,6 +2282,7 @@ class SimulatorManager:
 
         delivered_fragments = 0
         first_success_delay = None
+        first_delivered_packet = None
 
         for path_index, p_info in enumerate(paths_to_trace):
             route = list(p_info['path'])
@@ -2196,23 +2292,45 @@ class SimulatorManager:
                 self.nodes[source_id]._consume_energy(
                     tx_bytes=self.data_packet_bytes, tx_bits=self.data_packet_bits, distance=30.0)
 
-            packet = {
-                "source_id": source_id,
-                "seq": seq_num,
-                "timestamp": self.current_time,
-                "size_bytes": self.data_packet_bytes,
-                "size_bits": self.data_packet_bits,
-                "path_header": [source_id],
-                "payload": payload_value,
-                "priority": "HIGH" if is_critical else "NORMAL",
-                "fragment_id": path_index,
-                "required_fragments": required_fragments,
-                "energy_trace": [(source_id, self.nodes[source_id].E_current)]
-            }
+            if str(self.ablation.get('attack_model_mode', 'legacy_compatible')).strip().lower() == 'legacy_compatible':
+                # Byte-for-byte behavioral compatibility with the prior
+                # baseline packet construction. Corrected attack scenarios use
+                # the SensorNode-produced packet in the branch below.
+                packet = {
+                    "source_id": source_id,
+                    "seq": seq_num,
+                    "timestamp": self.current_time,
+                    "size_bytes": self.data_packet_bytes,
+                    "size_bits": self.data_packet_bits,
+                    "path_header": [source_id],
+                    "payload": payload_value,
+                    "priority": "HIGH" if is_critical else "NORMAL",
+                    "fragment_id": path_index,
+                    "required_fragments": required_fragments,
+                    "energy_trace": [(source_id, self.nodes[source_id].E_current)],
+                }
+            else:
+                packet = dict(source_packet or {})
+                packet.update({
+                    "source_id": source_id,
+                    "type": str(packet.get("type", "DATA")).upper(),
+                    "seq": seq_num,
+                    "timestamp": float(packet.get("timestamp", self.current_time)),
+                    "size_bytes": int(packet.get("size_bytes", self.data_packet_bytes)),
+                    "size_bits": float(packet.get("size_bits", self.data_packet_bits)),
+                    "path_header": [source_id],
+                    "payload": packet.get("payload", payload_value),
+                    "priority": "HIGH" if is_critical else "NORMAL",
+                    "fragment_id": path_index,
+                    "required_fragments": required_fragments,
+                    "energy_trace": list(packet.get(
+                        "energy_trace", [(source_id, self.nodes[source_id].E_current)])),
+                })
             packet["hash"] = compute_packet_hash(
                 packet, self.nodes[source_id].crypto_keys)
             packet_dropped = False
             path_log = [source_id]
+            malicious_delay_s = 0.0
 
             for idx in range(1, len(route)):
                 current_hop_id = route[idx]
@@ -2233,9 +2351,6 @@ class SimulatorManager:
                     self.nodes[sender_id].y - hop_node.y)
                 self._account_implicit_mac_ack(
                     sender_id, current_hop_id, incoming_distance)
-                if hop_node.is_malicious:
-                    packet_dropped = True
-                    break
                 next_hop_id = route[idx + 1] if idx + \
                     1 < len(route) else self.BS_ID
                 if next_hop_id != self.BS_ID:
@@ -2251,9 +2366,11 @@ class SimulatorManager:
                 if not success:
                     packet_dropped = True
                     break
+                malicious_delay_s += hop_node.attack_delay_seconds(
+                    self.current_time)
 
             if not packet_dropped and path_log[-1] == self.BS_ID:
-                simulated_delay = len(path_log) * 0.100
+                simulated_delay = len(path_log) * 0.100 + malicious_delay_s
                 delivered_fragments += 1
                 if first_success_delay is None or simulated_delay < first_success_delay:
                     first_success_delay = simulated_delay
@@ -2261,6 +2378,8 @@ class SimulatorManager:
                 packet_data["path_header"] = path_log
                 self.bs.data_plane_receive(
                     packet_data, path_log, receive_time=self.current_time + simulated_delay)
+                if first_delivered_packet is None:
+                    first_delivered_packet = dict(packet_data)
 
         if is_critical and self.ablation.get("use_critical_multipath_routing", False):
             attempted_redundant = max(0, len(paths_to_trace) - 1)
@@ -2289,6 +2408,24 @@ class SimulatorManager:
                 del self.metrics.end_to_end_delays[before_delay_len:]
             else:
                 self.metrics._unique_delivered_data_keys.add(key)
+
+        # A replay attack is generated by the actual source node and sent
+        # through the normal routing path with the same sequence number.  It is
+        # disabled in the non-regression baseline and enabled only by explicit
+        # end-to-end attack scenarios.
+        source_node = self.nodes.get(source_id)
+        if (allow_source_replay and first_delivered_packet is not None
+                and source_node is not None
+                and source_node.should_replay(self.current_time)):
+            replay_packet = dict(first_delivered_packet)
+            replay_packet['path_header'] = [source_id]
+            replay_packet['energy_trace'] = list(
+                first_delivered_packet.get('energy_trace', []))
+            source_node._transmit_packet(replay_packet, bool(is_critical))
+            self._trace_packet_path(
+                source_id, seq_num, is_critical, payload_value,
+                source_packet=replay_packet, seq_override=seq_num,
+                count_generated=False, allow_source_replay=False)
 
     def _push_updated_routes(self):
         # Reference routes and adaptive thresholds remain unchanged.

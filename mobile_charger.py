@@ -1,4 +1,5 @@
 import math
+import random
 import secrets
 from typing import Dict, Iterable, Optional
 
@@ -18,7 +19,8 @@ class MobileCharger:
     events continue while the charger is moving or dwelling at a cluster.
     """
 
-    def __init__(self, mc_id, depot_x, depot_y, capacity, speed, base_station, metrics_collector):
+    def __init__(self, mc_id, depot_x, depot_y, capacity, speed, base_station,
+                 metrics_collector, attack_config=None, rng_seed=None):
         self.mc_id = mc_id
         self.depot_x = float(depot_x)
         self.depot_y = float(depot_y)
@@ -41,6 +43,44 @@ class MobileCharger:
         self.report_counter = 0
         self.last_move_succeeded = True
         self.last_charge_details = {}
+        self.attack_config = dict(attack_config or {})
+        if rng_seed is None:
+            seed_text = str(self.mc_id)
+            rng_seed = sum((idx + 1) * ord(ch)
+                           for idx, ch in enumerate(seed_text))
+        self.attack_rng = random.Random(int(rng_seed))
+        self.attack_energy_claim_enabled = bool(
+            self.attack_config.get('mc_attack_energy_claim_enabled', False))
+        self.attack_energy_claim_factor = max(0.0, float(
+            self.attack_config.get('mc_attack_energy_claim_factor', 1.50)))
+        self.attack_location_spoof_enabled = bool(
+            self.attack_config.get('mc_attack_location_spoof_enabled', False))
+        self.attack_location_spoof_offset_m = float(
+            self.attack_config.get('mc_attack_location_spoof_offset_m', 100.0))
+        self.attack_forged_hmac_enabled = bool(
+            self.attack_config.get('mc_attack_forged_hmac_enabled', False))
+        self.attack_replay_enabled = bool(
+            self.attack_config.get('mc_attack_replay_enabled', False))
+        self.attack_probability = max(0.0, min(1.0, float(
+            self.attack_config.get('mc_attack_probability', 1.0))))
+        self.attack_on_off_enabled = bool(
+            self.attack_config.get('mc_attack_on_off_enabled', False))
+        self.attack_on_off_period_s = max(1e-9, float(
+            self.attack_config.get('mc_attack_on_off_period_s', 180.0)))
+        self.attack_on_fraction = max(0.0, min(1.0, float(
+            self.attack_config.get('mc_attack_on_fraction', 0.50))))
+
+    def _attack_active(self, current_time):
+        if not any((self.attack_energy_claim_enabled,
+                    self.attack_location_spoof_enabled,
+                    self.attack_forged_hmac_enabled,
+                    self.attack_replay_enabled)):
+            return False
+        if self.attack_on_off_enabled:
+            phase = float(current_time) % self.attack_on_off_period_s
+            if phase >= self.attack_on_fraction * self.attack_on_off_period_s:
+                return False
+        return self.attack_rng.random() < self.attack_probability
 
     @staticmethod
     def _calculate_distance(x1, y1, x2, y2):
@@ -348,8 +388,20 @@ class MobileCharger:
 
             self.report_counter += 1
             nonce = secrets.token_hex(12)
+            attack_active = self._attack_active(now)
+            reported_injected = float(actual_injected)
+            reported_x = float(self.x)
+            reported_y = float(self.y)
+            if attack_active and self.attack_energy_claim_enabled:
+                reported_injected *= self.attack_energy_claim_factor
+            if attack_active and self.attack_location_spoof_enabled:
+                reported_x += self.attack_location_spoof_offset_m
+                reported_y += self.attack_location_spoof_offset_m
+            report_key = self.crypto_keys
+            if attack_active and self.attack_forged_hmac_enabled:
+                report_key = f"FORGED-{self.mc_id}"
             mac_tag = make_mc_mac(
-                self.crypto_keys, node_id, actual_injected, self.x, self.y,
+                report_key, node_id, reported_injected, reported_x, reported_y,
                 mc_id=self.mc_id, counter=self.report_counter,
                 nonce=nonce, timestamp=now)
             expected_injected = min(
@@ -357,12 +409,23 @@ class MobileCharger:
                 power * float(session["elapsed"]),
                 initial_missing)
             accepted = self.bs.report_mc_injection_oob(
-                node_id, actual_injected, self.x, self.y, mac_tag,
+                node_id, reported_injected, reported_x, reported_y, mac_tag,
                 mc_id=self.mc_id, counter=self.report_counter,
                 nonce=nonce, timestamp=now,
                 charging_mode=("rf_cluster" if is_cluster else "contact"),
                 allowed_radius=allowed_radius,
                 expected_injected_energy=expected_injected)
+            replay_accepted = None
+            if attack_active and self.attack_replay_enabled:
+                # The compromised charger retransmits the exact same signed
+                # report.  Counter/nonce freshness must reject this second copy.
+                replay_accepted = self.bs.report_mc_injection_oob(
+                    node_id, reported_injected, reported_x, reported_y, mac_tag,
+                    mc_id=self.mc_id, counter=self.report_counter,
+                    nonce=nonce, timestamp=now,
+                    charging_mode=("rf_cluster" if is_cluster else "contact"),
+                    allowed_radius=allowed_radius,
+                    expected_injected_energy=expected_injected)
             if not accepted:
                 print(
                     f"[MC AUTH] Charging report from MC {self.mc_id} "
@@ -390,6 +453,7 @@ class MobileCharger:
                 "distance_to_stop": self._calculate_distance(
                     self.x, self.y, node.x, node.y),
                 "mc_report_accepted": bool(accepted),
+                "mc_replay_accepted": replay_accepted,
                 "node_receipt_consistent": bool(receipt_consistent),
             }
 

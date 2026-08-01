@@ -10,7 +10,8 @@ class SensorNode:
                  radio_e_elec_j_per_bit=50e-9,
                  radio_eps_fs_j_per_bit_m2=10e-12,
                  radio_eps_mp_j_per_bit_m4=0.0013e-12,
-                 radio_e_da_j_per_bit=5e-9):
+                 radio_e_da_j_per_bit=5e-9,
+                 attack_config=None):
         self.node_id = node_id
         self.rng = random.Random(
             int(node_id if rng_seed is None else rng_seed))
@@ -49,9 +50,72 @@ class SensorNode:
             1, int(math.ceil(self.control_packet_bits / 8.0)))
         self.network_nodes = {}
         self.is_malicious = False
+        self.behavior_state = "HONEST"
+        # Audit timestamps for the local remediation state machine.  They are
+        # metadata only and do not alter energy, routing, traffic, or trust.
+        self.remediation_time = None
+        self.rehabilitation_time = None
         self.sos_sent = False
         self.control_seq_counter = 0
         self.charge_receipt_counter = 0
+
+        # Attack behavior is explicit and configurable.  The default
+        # ``legacy_compatible`` profile reproduces the effective workload of
+        # the previous thesis baseline: DATA relays act as blackholes, control
+        # relays use 50% selective forwarding, source DATA energy is truthful,
+        # and malicious charge receipts retain the old false-energy claim.
+        # Corrected end-to-end attack scenarios can enable each behavior
+        # independently without silently changing the baseline experiment.
+        self.attack_config = dict(attack_config or {})
+        self.attack_model_mode = str(
+            self.attack_config.get('attack_model_mode', 'legacy_compatible')
+        ).strip().lower()
+        self.attack_false_energy_ratio = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_false_energy_ratio', 0.05))))
+        self.attack_false_energy_data_enabled = bool(
+            self.attack_config.get('attack_false_energy_data_enabled', False))
+        self.attack_false_energy_control_enabled = bool(
+            self.attack_config.get('attack_false_energy_control_enabled', True))
+        self.attack_false_energy_receipt_enabled = bool(
+            self.attack_config.get('attack_false_energy_receipt_enabled', True))
+        self.attack_data_drop_probability = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_data_drop_probability', 1.0))))
+        self.attack_control_drop_probability = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_control_drop_probability', 0.50))))
+        self.attack_false_sos_mode = str(
+            self.attack_config.get('attack_false_sos_mode', 'legacy_compatible')
+        ).strip().lower()
+        self.attack_false_sos_probability_per_epoch = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_false_sos_probability_per_epoch', 0.05))))
+        self.attack_false_sos_energy_ratio = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_false_sos_energy_ratio', 0.05))))
+        self.attack_control_epoch_s = max(1e-9, float(
+            self.attack_config.get('attack_control_epoch_s', 10.0)))
+        self.attack_tamper_enabled = bool(
+            self.attack_config.get('attack_tamper_enabled', False))
+        self.attack_tamper_probability = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_tamper_probability', 0.0))))
+        self.attack_delay_enabled = bool(
+            self.attack_config.get('attack_delay_enabled', False))
+        self.attack_delay_probability = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_delay_probability', 0.0))))
+        self.attack_delay_min_s = max(0.0, float(
+            self.attack_config.get('attack_delay_min_s', 0.25)))
+        self.attack_delay_max_s = max(self.attack_delay_min_s, float(
+            self.attack_config.get('attack_delay_max_s', 1.00)))
+        self.attack_replay_enabled = bool(
+            self.attack_config.get('attack_replay_enabled', False))
+        self.attack_replay_probability = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_replay_probability', 0.0))))
+        self.attack_on_off_enabled = bool(
+            self.attack_config.get('attack_on_off_enabled', False))
+        self.attack_on_off_period_s = max(1e-9, float(
+            self.attack_config.get('attack_on_off_period_s', 120.0)))
+        self.attack_on_fraction = max(0.0, min(1.0, float(
+            self.attack_config.get('attack_on_fraction', 0.50))))
+        self.attack_on_off_phase_s = float(
+            self.attack_config.get('attack_on_off_phase_s', 0.0))
+        self._last_false_sos_epoch = None
 
         self.E_elec = max(0.0, float(radio_e_elec_j_per_bit))
         self.eps_fs = max(0.0, float(radio_eps_fs_j_per_bit_m2))
@@ -69,6 +133,84 @@ class SensorNode:
         self.has_fixed_charger = False
         self.last_trickle_time = None
         self.cached_tx_range = 40.0
+
+    def set_malicious(self, value=True):
+        self.is_malicious = bool(value)
+        self.behavior_state = "MALICIOUS" if self.is_malicious else "HONEST"
+        if self.is_malicious:
+            self.remediation_time = None
+            self.rehabilitation_time = None
+
+    def remediate(self, current_time=None):
+        """Move a malicious node into a truthful probation state.
+
+        The baseline scenario does not schedule remediation.  In an explicit
+        remediation scenario, SimulatorManager calls this method at
+        ``attack_remediation_time_s``.  Attack behavior stops immediately, but
+        the node remains labelled PROBATION until the configured probation
+        interval has elapsed.
+        """
+        self.is_malicious = False
+        self.behavior_state = "PROBATION"
+        self.remediation_time = (
+            None if current_time is None else float(current_time))
+        self.rehabilitation_time = None
+
+    def complete_rehabilitation(self, current_time=None):
+        """Complete the local PROBATION -> HONEST state transition.
+
+        This changes only the node's lifecycle label.  Attack behavior is
+        already disabled by :meth:`remediate`, so this transition does not
+        change packet generation, forwarding, charging receipts, or energy.
+        """
+        self.is_malicious = False
+        self.behavior_state = "HONEST"
+        self.rehabilitation_time = (
+            None if current_time is None else float(current_time))
+
+    def is_attack_active(self, current_time):
+        if not self.is_malicious or self.behavior_state != "MALICIOUS":
+            return False
+        if not self.attack_on_off_enabled:
+            return True
+        phase = (float(current_time) + self.attack_on_off_phase_s) % self.attack_on_off_period_s
+        return phase < self.attack_on_fraction * self.attack_on_off_period_s
+
+    def _reported_energy(self, current_time, context='data'):
+        if not self.is_attack_active(current_time):
+            return float(self.E_current)
+        enabled = {
+            'data': self.attack_false_energy_data_enabled,
+            'control': self.attack_false_energy_control_enabled,
+            'receipt': self.attack_false_energy_receipt_enabled,
+        }.get(str(context).lower(), False)
+        if enabled:
+            return max(0.0, float(self.E_max) * self.attack_false_energy_ratio)
+        return float(self.E_current)
+
+    def attack_delay_seconds(self, current_time):
+        if not self.is_attack_active(current_time) or not self.attack_delay_enabled:
+            return 0.0
+        if self.rng.random() >= self.attack_delay_probability:
+            return 0.0
+        return self.rng.uniform(self.attack_delay_min_s, self.attack_delay_max_s)
+
+    def should_replay(self, current_time):
+        if not self.is_attack_active(current_time) or not self.attack_replay_enabled:
+            return False
+        return self.rng.random() < self.attack_replay_probability
+
+    def _maybe_tamper_packet(self, packet, current_time):
+        if not self.is_attack_active(current_time) or not self.attack_tamper_enabled:
+            return False
+        if self.rng.random() >= self.attack_tamper_probability:
+            return False
+        payload = packet.get('payload')
+        if isinstance(payload, (int, float)):
+            packet['payload'] = float(payload) + 1.0
+        else:
+            packet['payload'] = f"{payload}|tampered"
+        return True
 
     def check_route_health(self, nodes, tx_range, current_time):
         # Cache the tx_range for fixed charger self-discovery
@@ -133,10 +275,6 @@ class SensorNode:
         critical_flag = 1 if raw_data_value > self.adaptive_threshold else 0
         is_critical = (critical_flag == 1)
 
-        reported_energy = self.E_current
-        if self.is_malicious:
-            reported_energy = self.E_max * 0.05
-
         packet = {
             "source_id": self.node_id,
             "type": "DATA",
@@ -145,13 +283,22 @@ class SensorNode:
             "timestamp": current_time,
             "size_bytes": self.data_packet_bytes,
             "size_bits": self.data_packet_bits,
-            "energy_trace": [(self.node_id, reported_energy)]
+            "energy_trace": []
         }
 
         self._transmit_packet(packet, is_critical)
+        # Preserve the original baseline timing: DATA energy telemetry is the
+        # residual value after the source radio transmission has been charged.
+        # Corrected false-energy scenarios replace this post-TX value with the
+        # configured malicious claim.
+        packet["energy_trace"] = [(
+            self.node_id,
+            self._reported_energy(current_time, context='data')
+        )]
         exec_time_ms = (time.time() - start_time) * 1000
         self.metrics.record_execution_time('EDGE', exec_time_ms)
         self._reset_inactivity_timer(current_time)
+        return packet
 
     def _distance_to_next_hop(self, next_hop_id, fallback=40.0):
         if self.network_nodes and next_hop_id in self.network_nodes:
@@ -191,6 +338,17 @@ class SensorNode:
         if self.status == "DEAD":
             return False
 
+        packet_type = str(packet.get('type', 'DATA')).upper()
+        attack_active = self.is_attack_active(current_time)
+
+        # Preserve the effective legacy DATA workload exactly: a malicious
+        # relay is a blackhole and drops before RX/trace accounting.  The
+        # corrected selective-forwarding scenarios use the normal path below.
+        if (attack_active and packet_type == 'DATA'
+                and self.attack_model_mode == 'legacy_compatible'
+                and self.attack_data_drop_probability >= 1.0 - 1e-15):
+            return False
+
         if "path_header" not in packet:
             packet["path_header"] = []
 
@@ -198,17 +356,25 @@ class SensorNode:
         self._consume_energy(rx_bytes=packet["size_bytes"],
                              rx_bits=packet.get("size_bits"))
 
-        reported_energy = self.E_current
-        if self.is_malicious:
-            reported_energy = self.E_max * 0.05
+        context = 'data' if packet_type == 'DATA' else 'control'
+        reported_energy = self._reported_energy(current_time, context=context)
 
         if "energy_trace" not in packet:
             packet["energy_trace"] = []
         packet["energy_trace"].append((self.node_id, reported_energy))
 
-        if self.is_malicious:
-            if self.rng.random() < 0.50:
+        if attack_active:
+            drop_probability = (
+                self.attack_data_drop_probability
+                if packet_type == 'DATA'
+                else self.attack_control_drop_probability
+            )
+            if self.rng.random() < drop_probability:
                 return False
+
+            # Tampering is performed after source authentication was created.
+            # The BS therefore detects it as a source-HMAC failure.
+            self._maybe_tamper_packet(packet, current_time)
 
         self._consume_energy(
             tx_bytes=packet["size_bytes"], tx_bits=packet.get("size_bits"),
@@ -227,14 +393,33 @@ class SensorNode:
         battery_critical = self.E_current <= self.E_critical
         long_silence = silence_duration >= self.T_max_inactivity
 
-        if self.is_malicious:
-            if self.rng.random() < 0.05 and not self.sos_sent:
-                temp_battery = self.E_current
-                self.E_current = 0.01
-                packet = self._send_sos_charge_request(current_time)
-                self.E_current = temp_battery
-                self.sos_sent = True
-                return packet
+        if self.is_attack_active(current_time):
+            if self.attack_false_sos_mode == 'legacy_compatible':
+                # Exact compatibility path retained only for the thesis
+                # baseline; corrected scenarios use a per-epoch probability
+                # and never mutate physical battery state.
+                # The random draw intentionally occurs even when ``sos_sent``
+                # is already true because that is the exact evaluation order
+                # of the previous implementation and therefore preserves the
+                # node RNG stream used later by control forwarding.
+                if self.rng.random() < 0.05 and not self.sos_sent:
+                    temp_battery = self.E_current
+                    self.E_current = 0.01
+                    packet = self._send_sos_charge_request(current_time)
+                    self.E_current = temp_battery
+                    self.sos_sent = True
+                    return packet
+            elif (not self.sos_sent and
+                  self.attack_false_sos_mode not in {'disabled', 'off', 'none'}):
+                epoch = int(math.floor(float(current_time) / self.attack_control_epoch_s))
+                if epoch != self._last_false_sos_epoch:
+                    self._last_false_sos_epoch = epoch
+                    if self.rng.random() < self.attack_false_sos_probability_per_epoch:
+                        false_claim = max(
+                            0.0, float(self.E_max) * self.attack_false_sos_energy_ratio)
+                        self.sos_sent = True
+                        return self._send_sos_charge_request(
+                            current_time, reported_energy=false_claim)
 
         if battery_critical and long_silence and not self.sos_sent:
             self.sos_sent = True
@@ -244,7 +429,12 @@ class SensorNode:
             return self._send_keep_alive(current_time)
         return None
 
-    def _send_sos_charge_request(self, current_time):
+    def _send_sos_charge_request(self, current_time, reported_energy=None):
+        energy_claim = (
+            float(self.E_current)
+            if reported_energy is None
+            else max(0.0, float(reported_energy))
+        )
         packet = {
             'source_id': self.node_id,
             'type': 'SOS_CHARGE',
@@ -252,7 +442,7 @@ class SensorNode:
             'timestamp': current_time,
             'size_bytes': self.control_packet_bytes,
             'size_bits': self.control_packet_bits,
-            'energy_trace': [(self.node_id, self.E_current)]
+            'energy_trace': [(self.node_id, energy_claim)]
         }
         self._finalize_source_control_packet(packet)
         self._transmit_packet(packet, is_critical=True)
@@ -342,10 +532,11 @@ class SensorNode:
         before = max(0.0, float(energy_before))
         physical_after = max(0.0, float(energy_after))
         reported_after = physical_after
-        if self.is_malicious:
-            reported_after = max(0.0, float(self.E_max) * 0.05)
+        if self.is_attack_active(timestamp) and self.attack_false_energy_receipt_enabled:
+            reported_after = max(
+                0.0, float(self.E_max) * self.attack_false_energy_ratio)
         claimed_received = max(0.0, float(received_energy))
-        if self.is_malicious:
+        if self.is_attack_active(timestamp) and self.attack_false_energy_receipt_enabled:
             claimed_received = max(0.0, reported_after - before)
         tag = make_node_charge_receipt_mac(
             self.crypto_keys, self.node_id, before, reported_after,

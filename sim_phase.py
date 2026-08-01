@@ -194,6 +194,50 @@ def _base_config():
         'enable_periodic_hello': False,
         'route_recompute_period': None,
         'data_packet_bits': DATA_PACKET_BITS,
+
+        # Explicit attack model. ``legacy_compatible`` is the non-regression
+        # thesis baseline; dedicated attack-suite scenarios below enable the
+        # corrected end-to-end models independently.
+        'attack_model_mode': 'legacy_compatible',
+        'attack_data_drop_probability': 1.0,
+        'attack_control_drop_probability': 0.50,
+        'attack_false_energy_ratio': 0.05,
+        'attack_false_energy_data_enabled': False,
+        'attack_false_energy_control_enabled': True,
+        'attack_false_energy_receipt_enabled': True,
+        'attack_false_sos_mode': 'legacy_compatible',
+        'attack_false_sos_probability_per_epoch': 0.05,
+        'attack_false_sos_energy_ratio': 0.05,
+        'attack_control_epoch_s': 10.0,
+        'attack_delay_enabled': False,
+        'attack_delay_probability': 0.0,
+        'attack_delay_min_s': 0.25,
+        'attack_delay_max_s': 1.00,
+        'attack_tamper_enabled': False,
+        'attack_tamper_probability': 0.0,
+        'attack_replay_enabled': False,
+        'attack_replay_probability': 0.0,
+        'attack_on_off_enabled': False,
+        'attack_on_off_period_s': 120.0,
+        'attack_on_fraction': 0.50,
+        'attack_remediation_time_s': None,
+        # When remediation is enabled, keep the node in local PROBATION for
+        # one control epoch before completing the label transition to HONEST.
+        # Baseline results are unchanged because remediation itself is disabled.
+        'attack_rehabilitation_delay_s': 10.0,
+
+        'mc_attack_energy_claim_enabled': False,
+        'mc_attack_energy_claim_factor': 1.50,
+        'mc_attack_location_spoof_enabled': False,
+        'mc_attack_location_spoof_offset_m': 100.0,
+        'mc_attack_forged_hmac_enabled': False,
+        'mc_attack_replay_enabled': False,
+        'mc_attack_probability': 1.0,
+        'mc_attack_on_off_enabled': False,
+
+        'fake_charger_attack_enabled': False,
+        'fake_charger_attack_probability_per_epoch': 0.0,
+        'fake_charger_attack_energy_ratio': 0.35,
         'attack_percentage': 0.15,
         'critical_event_probability': 0.10,
         'transmission_range': 40.0,
@@ -225,6 +269,8 @@ def _scenarios_for_mode(mode):
         'paper_mc': 'article_scaled', 'article_compare': 'article_scaled',
         'article_energy_mc_sweep': 'article_scaled',
         'article_energy_comparison': 'article_scaled',
+        'attacks': 'attack_suite', 'attack': 'attack_suite',
+        'attack_validation': 'attack_suite', 'end_to_end_attacks': 'attack_suite',
     }
     mode = aliases.get(mode, mode)
 
@@ -581,6 +627,96 @@ def _scenarios_for_mode(mode):
             add(f'Sweep_WindowW_{w}', sliding_window_size=w)
         return out
 
+    def get_attack_suite():
+        """Corrected end-to-end attack scenarios.
+
+        The default energy scenario remains legacy-compatible for exact result
+        preservation.  These scenarios activate one attack at a time through
+        the real SensorNode/MobileCharger execution paths.
+        """
+        out = []
+
+        def add(name, **changes):
+            c = dict(base)
+            c.update({
+                'experiment_family': 'end_to_end_attack_validation',
+                'attack_model_mode': 'corrected_end_to_end',
+                'attack_data_drop_probability': 0.0,
+                'attack_control_drop_probability': 0.0,
+                'attack_false_energy_data_enabled': False,
+                'attack_false_energy_control_enabled': False,
+                'attack_false_energy_receipt_enabled': False,
+                'attack_false_sos_mode': 'disabled',
+                'attack_delay_enabled': False,
+                'attack_tamper_enabled': False,
+                'attack_replay_enabled': False,
+                'attack_on_off_enabled': False,
+                'mc_attack_energy_claim_enabled': False,
+                'mc_attack_location_spoof_enabled': False,
+                'mc_attack_forged_hmac_enabled': False,
+                'mc_attack_replay_enabled': False,
+                'fake_charger_attack_enabled': False,
+            })
+            c.update(changes)
+            out.append((name, c))
+
+        add('Attack_Blackhole_EndToEnd',
+            attack_data_drop_probability=1.0)
+        add('Attack_SelectiveForwarding_50_EndToEnd',
+            attack_data_drop_probability=0.50)
+        add('Attack_FalseEnergy_EndToEnd',
+            attack_false_energy_data_enabled=True,
+            attack_false_energy_receipt_enabled=True)
+        add('Attack_FalseSOS_EndToEnd',
+            attack_false_sos_mode='per_epoch',
+            attack_false_sos_probability_per_epoch=0.25)
+        add('Attack_Delay_EndToEnd',
+            attack_delay_enabled=True,
+            attack_delay_probability=0.75,
+            attack_delay_min_s=0.50,
+            attack_delay_max_s=2.00)
+        add('Attack_Tamper_EndToEnd',
+            attack_tamper_enabled=True,
+            attack_tamper_probability=0.75)
+        add('Attack_Replay_EndToEnd',
+            attack_replay_enabled=True,
+            attack_replay_probability=0.50,
+            use_critical_multipath_routing=False)
+        add('Attack_OnOff_SelectiveForwarding_EndToEnd',
+            attack_data_drop_probability=0.75,
+            attack_on_off_enabled=True,
+            attack_on_off_period_s=120.0,
+            attack_on_fraction=0.50)
+        add('Attack_Remediation_EndToEnd',
+            attack_false_energy_data_enabled=True,
+            attack_false_energy_receipt_enabled=True,
+            attack_remediation_time_s=600.0,
+            attack_rehabilitation_delay_s=10.0)
+        add('Attack_MC_FalseEnergy_EndToEnd',
+            enable_energy_experiment=True,
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            mc_attack_energy_claim_enabled=True)
+        add('Attack_MC_LocationSpoof_EndToEnd',
+            enable_energy_experiment=True,
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            mc_attack_location_spoof_enabled=True)
+        add('Attack_MC_ForgedHMAC_EndToEnd',
+            enable_energy_experiment=True,
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            mc_attack_forged_hmac_enabled=True)
+        add('Attack_MC_Replay_EndToEnd',
+            enable_energy_experiment=True,
+            use_adaptive_quantum_charging=True,
+            use_dqn_charger_routing=True,
+            mc_attack_replay_enabled=True)
+        add('Attack_FakeCharger_EndToEnd',
+            fake_charger_attack_enabled=True,
+            fake_charger_attack_probability_per_epoch=0.25)
+        return out
+
     if mode == 'article_scaled':
         return get_article_scaled_single()
     if mode == 'physical_compromise':
@@ -595,6 +731,8 @@ def _scenarios_for_mode(mode):
         return [('Phase1_Method', base)] + get_ablation() + get_energy() + get_mc_ablation() + get_routing_ablation() + _physical_compromise_scenarios()
     if mode in ('parameter_sweep', 'stress_sweep', 'innovation_parameter_sweep'):
         return get_parameter_sweep()
+    if mode == 'attack_suite':
+        return get_attack_suite()
     if mode == 'energy':
         return get_energy()
     if mode == 'mc_ablation':
