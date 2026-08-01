@@ -2,5 +2,8 @@
 /Results/*
 /README.md
 /requirements.txt
+/requirements_stage2.txt
 /.gitignore
-/__pycache__/
+__pycache__/
+*.py[cod]
+stage2_results/*

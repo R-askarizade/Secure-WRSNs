@@ -1,0 +1,65 @@
+{
+  "scenario_mode": "energy",
+  "num_nodes": 100,
+  "simulation_time_s": 3600,
+  "network_size": [100.0, 100.0],
+  "sensitivity_seeds": [101, 102, 103, 104],
+  "optimization_seeds": [201, 202, 203, 204, 205, 206],
+  "final_evaluation_seeds": [
+    1001, 1002, 1003, 1004, 1005,
+    1006, 1007, 1008, 1009, 1010
+  ],
+  "analysis_metrics": [
+    "MC_Deadline_Failure_Rate",
+    "Energy_Critical_Death_Rate",
+    "MC_End_To_End_Useful_Efficiency",
+    "MC_Total_Mission_Energy",
+    "Critical_PDR",
+    "MCC",
+    "Avg_Delay",
+    "BS_Execution_Time_ms"
+  ],
+  "selection_metrics": [
+    "MC_Deadline_Failure_Rate",
+    "Energy_Critical_Death_Rate",
+    "MC_End_To_End_Useful_Efficiency",
+    "MC_Total_Mission_Energy",
+    "Critical_PDR",
+    "MCC"
+  ],
+  "morris": {
+    "candidate_trajectories": 100,
+    "optimal_trajectories": 12,
+    "num_levels": 8,
+    "bootstrap_resamples": 1000,
+    "selection_mu_star_fraction": 0.05,
+    "selection_sigma_fraction": 0.10,
+    "min_selected": 4,
+    "max_selected": 16
+  },
+  "sobol": {
+    "base_sample_n": 256,
+    "calc_second_order": false,
+    "bootstrap_resamples": 1000,
+    "selection_total_effect": 0.05,
+    "max_selected": 42
+  },
+  "tuning": {
+    "n_trials": 160,
+    "initial_design_configs": 16,
+    "walltime_limit_s": 604800,
+    "max_config_calls": 6,
+    "objectives": [
+      "deadline_failure",
+      "mission_energy_ratio",
+      "critical_pdr_loss",
+      "mcc_loss"
+    ],
+    "constraints": {
+      "overall_pdr_drop_percentage_points": 0.5,
+      "mcc_drop": 0.02,
+      "max_fail_closed_increase": 0.0
+    },
+    "constraint_penalty": 10.0
+  }
+}
