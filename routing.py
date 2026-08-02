@@ -921,6 +921,58 @@ class DataPlaneHybridRouting:
             'vector': vector,
         }
 
+    def _least_overlap_safe_path(self, graph, source, primary):
+        """Find a globally least-overlap alternate with security priority.
+
+        The scalarized edge cost is lexicographic in practice: internal-node
+        overlap, shared-edge overlap, accumulated security stress, then the
+        original energy-aware route weight.  All components are non-negative,
+        so Dijkstra remains valid.
+        """
+        primary = list(primary or [])
+        if len(primary) < 2:
+            return []
+        primary_internal = frozenset(primary[1:-1])
+        primary_edges = frozenset(zip(primary[:-1], primary[1:]))
+        n_bound = max(2, graph.number_of_nodes())
+        edge_weights = [
+            max(0.0, float(data.get('weight', 1.0)))
+            for _, _, data in graph.edges(data=True)
+            if math.isfinite(float(data.get('weight', 1.0)))
+        ]
+        max_edge_weight = max(edge_weights, default=1.0)
+
+        # Security stress is in [0, 1] per hop.  Make one unit of accumulated
+        # security risk dominate every possible difference in base route cost.
+        base_path_bound = n_bound * max(max_edge_weight, 1.0) + 1.0
+        security_unit = base_path_bound
+        safe_path_bound = n_bound * (security_unit + max_edge_weight) + 1.0
+        edge_overlap_unit = safe_path_bound
+        node_overlap_unit = (n_bound + 1.0) * edge_overlap_unit
+
+        def route_weight(u, v, data):
+            node_overlap = 1.0 if v in primary_internal else 0.0
+            edge_overlap = 1.0 if (u, v) in primary_edges else 0.0
+            security = float(np.clip(
+                data.get('security_stress', 0.0), 0.0, 1.0))
+            base = max(0.0, float(data.get('weight', 1.0)))
+            return (
+                node_overlap * node_overlap_unit
+                + edge_overlap * edge_overlap_unit
+                + security * security_unit
+                + base
+            )
+
+        try:
+            path = nx.shortest_path(
+                graph, source, self.bs_id, weight=route_weight)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return []
+        if path == primary or not self._valid_path(
+                graph, path, source, self.bs_id):
+            return []
+        return list(path)
+
     def _secondary_candidates(self, graph, source, primary):
         """Generate a compact, diverse alternate-path pool.
 
@@ -1035,6 +1087,25 @@ class DataPlaneHybridRouting:
             ref_pair_max, ref_pair_p95 = self._stress_stats(ref_pair, nodes)
 
         candidates = self._secondary_candidates(graph, source, primary)
+        # Preserve the exact reference/replacement candidate set whenever a
+        # valid secondary already exists.  The global least-overlap search is
+        # activated only to fill a genuine missing second route, preventing
+        # avoidable changes to established experiment trajectories.
+        require_two_routes = bool(self._cfg(
+            'critical_require_two_routes', True))
+        secondary_selection_mode = str(self._cfg(
+            'critical_secondary_selection_mode', 'least_overlap_safest'
+        )).strip().lower()
+        if (not ref_valid and require_two_routes and not candidates and
+                secondary_selection_mode in {
+                    'least_overlap_safest', 'least_overlap_safe',
+                    'minimum_overlap_safe'
+                }):
+            least_overlap_safe = self._least_overlap_safe_path(
+                graph, source, primary)
+            if (least_overlap_safe and
+                    tuple(least_overlap_safe) not in {tuple(p) for p in candidates}):
+                candidates.append(least_overlap_safe)
         scored = []
         candidate_qualities = []
         max_cost_stretch = max(
@@ -1065,17 +1136,21 @@ class DataPlaneHybridRouting:
         scored.sort(key=lambda item: item[0])
         best_score, best_path, best_quality = scored[0]
         if ref_quality is None:
-            # Do not add a second transmitted copy where the original method
-            # had none; retain it only as a standby repair route.
-            standby_path = min(
-                candidate_qualities,
-                key=lambda item: (
-                    item[1]['class'],
-                    item[1]['node_overlap_ratio'],
-                    item[1]['energy'],
-                ),
-            )[0] if candidate_qualities else []
-            return [], 'standby_only', list(standby_path)
+            if not require_two_routes:
+                standby_path = min(
+                    candidate_qualities,
+                    key=lambda item: (
+                        item[1]['class'],
+                        item[1]['node_overlap_ratio'],
+                        item[1]['energy'],
+                    ),
+                )[0] if candidate_qualities else []
+                return [], 'standby_only', list(standby_path)
+            # A distinct second route is now part of the critical route table.
+            # To preserve non-regression, synthesized routes default to
+            # failover activation and therefore add no radio cost while the
+            # primary succeeds.
+            return list(best_path), 'synthesized', []
         ref_score = (
             ref_quality['class'], ref_quality['node_overlap_ratio'],
             ref_quality['edge_overlap_ratio'], ref_quality['risk'],
@@ -1092,6 +1167,8 @@ class DataPlaneHybridRouting:
             'primary_path': [], 'secondary_path': [], 'critical_paths': [],
             'standby_secondary_path': [],
             'reference_primary_path': [], 'reference_secondary_path': [],
+            'secondary_mode': 'none', 'secondary_origin': None,
+            'secondary_node_overlap': 0, 'secondary_edge_overlap': 0,
             'cluster_head': None, 'data_route_mode': 'unreachable',
         }
 
@@ -1116,6 +1193,14 @@ class DataPlaneHybridRouting:
                 table['reference_primary_path'] = list(table['primary_path'])
                 table['reference_secondary_path'] = list(
                     table['secondary_path'])
+                table['secondary_mode'] = str(
+                    ref.get('secondary_mode',
+                            'redundant' if table['secondary_path'] else 'none'))
+                table['secondary_origin'] = ref.get('secondary_origin')
+                table['secondary_node_overlap'] = int(
+                    ref.get('secondary_node_overlap', 0) or 0)
+                table['secondary_edge_overlap'] = int(
+                    ref.get('secondary_edge_overlap', 0) or 0)
                 table['data_route_mode'] = 'reference_only'
                 mirrored[nid] = table
             self.last_cluster_heads = []
@@ -1188,10 +1273,13 @@ class DataPlaneHybridRouting:
 
         secondary_replaced = 0
         secondary_reference_kept = 0
+        secondary_synthesized = 0
+        secondary_failover = 0
         secondary_node_disjoint = 0
         secondary_edge_disjoint = 0
         standby_count = 0
         overlap_values = []
+        unavoidable_no_backup = 0
 
         for source, ref_primary in ref_paths.items():
             primary = selected.get(source, ref_primary)
@@ -1207,6 +1295,8 @@ class DataPlaneHybridRouting:
                 secondary_replaced += 1
             elif status == 'reference_kept':
                 secondary_reference_kept += 1
+            elif status == 'synthesized':
+                secondary_synthesized += 1
 
             table = tables[source]
             table['primary_path'] = list(primary)
@@ -1223,10 +1313,38 @@ class DataPlaneHybridRouting:
                 table['critical_paths'].append(list(secondary))
                 quality = self._secondary_quality(graph, primary, secondary)
                 overlap_values.append(quality['node_overlap_ratio'])
+                table['secondary_node_overlap'] = int(
+                    quality['node_overlap'])
+                table['secondary_edge_overlap'] = int(
+                    quality['edge_overlap'])
+                if status == 'synthesized':
+                    mode = str(self._cfg(
+                        'critical_synthesized_secondary_mode', 'failover'
+                    )).strip().lower()
+                    origin = 'least_overlap_safe'
+                else:
+                    # Preserve the activation policy of the reference route.
+                    # A reference path synthesized for sparse topologies stays
+                    # failover-only even if the DATA overlay improves it.
+                    mode = str(ref_table.get(
+                        'secondary_mode', 'redundant')).strip().lower()
+                    origin = (
+                        'enhanced_replacement' if status == 'replaced'
+                        else ref_table.get(
+                            'secondary_origin', 'reference_secondary')
+                    )
+                if mode not in {'failover', 'redundant'}:
+                    mode = 'failover' if status == 'synthesized' else 'redundant'
+                table['secondary_mode'] = mode
+                table['secondary_origin'] = origin
+                if mode == 'failover':
+                    secondary_failover += 1
                 if quality['class'] == 0:
                     secondary_node_disjoint += 1
                 elif quality['class'] == 1:
                     secondary_edge_disjoint += 1
+            else:
+                unavoidable_no_backup += 1
             table['standby_secondary_path'] = list(standby)
 
         diagnostics.update({
@@ -1234,9 +1352,15 @@ class DataPlaneHybridRouting:
             'cluster_count': float(len(heads)),
             'secondary_replaced_count': float(secondary_replaced),
             'secondary_reference_kept_count': float(secondary_reference_kept),
+            'secondary_synthesized_count': float(secondary_synthesized),
+            'secondary_failover_count': float(secondary_failover),
             'secondary_node_disjoint_count': float(secondary_node_disjoint),
             'secondary_edge_disjoint_count': float(secondary_edge_disjoint),
             'secondary_standby_count': float(standby_count),
+            'critical_two_route_count': float(
+                len(ref_paths) - unavoidable_no_backup),
+            'critical_unavoidable_no_backup_count': float(
+                unavoidable_no_backup),
             'secondary_average_node_overlap': float(np.mean(overlap_values)) if overlap_values else 0.0,
         })
         self.last_diagnostics = diagnostics

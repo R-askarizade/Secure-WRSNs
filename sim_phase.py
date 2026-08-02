@@ -34,6 +34,18 @@ def _base_config():
         'use_gradient_symmetric_discovery': True,
         'use_adaptive_edge_threshold': True,
         'use_critical_multipath_routing': True,
+        # Retain two distinct critical routes whenever topology permits.
+        'critical_require_two_routes': True,
+        'critical_secondary_selection_mode': 'least_overlap_safest',
+        # Synthesized second routes activate only after primary failure.
+        'critical_synthesized_secondary_mode': 'failover',
+        # Non-regression energy shield for synthesized failovers.
+        'critical_failover_energy_guard': _env_enabled(
+            'WRSN_CRITICAL_FAILOVER_ENERGY_GUARD', '1'),
+        'critical_failover_min_energy_ratio': float(os.environ.get(
+            'WRSN_CRITICAL_FAILOVER_MIN_ENERGY_RATIO', 0.65)),
+        'critical_failover_reserve_margin_ratio': float(os.environ.get(
+            'WRSN_CRITICAL_FAILOVER_RESERVE_MARGIN_RATIO', 0.05)),
         'use_implicit_piggyback_telemetry': True,
         'use_network_tomography_for_delay': True,
         'use_intersection_logic_for_droppers': True,
@@ -160,6 +172,42 @@ def _base_config():
 
         'mobile_charger_selection_mode': 'hardcoded',
         'num_mobile_chargers': 1,
+
+        # Cost-aware adaptive fleet sizing. The hardcoded default preserves
+        # the published single-charger baseline; dynamic/cost_aware mode uses
+        # the smallest fleet satisfying node ratio, energy balance, service
+        # time, and response-time coverage constraints.
+        'mobile_charger_count_safety_factor': 1.10,
+        'mobile_charger_service_utilization': 0.70,
+        'mobile_charger_expected_request_fraction': 0.25,
+        'mobile_charger_average_recharge_fraction': 0.50,
+        'mobile_charger_service_horizon_s': 900.0,
+        'mobile_charger_response_deadline_s': 90.0,
+        'mobile_charger_response_margin_s': 0.0,
+        'mobile_charger_dispatch_overhead_s': 0.0,
+        'mobile_charger_spatial_packing_efficiency': 0.65,
+        'mobile_charger_estimated_node_power_j_per_s': None,
+        'mobile_charger_unit_purchase_cost': 0.0,
+        'mobile_charger_unit_integration_cost': 0.0,
+        'mobile_charger_annual_maintenance_cost': 0.0,
+        'mobile_charger_economic_life_years': 3.0,
+        'mobile_charger_total_budget': None,
+        'mobile_charger_budget_policy': 'performance_first',
+        'mobile_charger_cost_currency': 'user_defined',
+
+        # Dead nodes remain chargeable and can re-enter the ALIVE state after
+        # receiving sufficient energy. A zero threshold preserves legacy
+        # behavior (any positive physically delivered energy can revive).
+        'enable_dead_node_revival': True,
+        'dead_node_revival_min_energy_ratio': 0.0,
+
+        # Multi-MC spatial safety is opt-in so the one-MC baseline is exactly
+        # preserved. Stable angular regions are soft preferences; the RF-zone
+        # separation guard permits verified emergency overrides.
+        'use_stable_charger_regions': False,
+        'use_interference_safe_multi_mc_dispatch': False,
+        'mobile_charger_safe_distance_m': 0.0,
+        'mobile_charger_physical_footprint_m': 0.0,
 
         'mobile_charger_capacity_mode': 'absolute',
         'mobile_charger_capacity': 50000.0,
@@ -482,6 +530,9 @@ def _scenarios_for_mode(mode):
                 mobile_charger_travel_sensor_equivalent_cost_per_m=0.0005,
                 mobile_charger_speeds=[5.0, 5.0, 5.0],
                 use_relative_mc_feasibility_guard=True,
+                use_stable_charger_regions=True,
+                use_interference_safe_multi_mc_dispatch=True,
+                mobile_charger_safe_distance_m=2.0,
                 max_adaptive_charge_queue=18)
             add('MC_Full_QIFL_DQN_MultiMC_Dynamic',
                 use_adaptive_quantum_charging=True,
@@ -496,6 +547,9 @@ def _scenarios_for_mode(mode):
                     100.0, 80.0, 60.0, 45.0],
                 mobile_charger_travel_sensor_equivalent_cost_per_m=0.0005,
                 use_relative_mc_feasibility_guard=True,
+                use_stable_charger_regions=True,
+                use_interference_safe_multi_mc_dispatch=True,
+                mobile_charger_safe_distance_m=2.0,
                 max_adaptive_charge_queue=18)
 
         if _env_enabled('WRSN_ENABLE_MC_COUNT_SWEEP'):
@@ -512,6 +566,9 @@ def _scenarios_for_mode(mode):
                     mobile_charger_travel_sensor_equivalent_cost_per_m=0.0005,
                     mobile_charger_speeds=[5.0] * mc_count,
                     use_relative_mc_feasibility_guard=True,
+                    use_stable_charger_regions=(mc_count > 1),
+                    use_interference_safe_multi_mc_dispatch=(mc_count > 1),
+                    mobile_charger_safe_distance_m=2.0 if mc_count > 1 else 0.0,
                     max_adaptive_charge_queue=max(18, mc_count * 5))
 
         add('MC_No_Fixed_Chargers',

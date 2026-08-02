@@ -5,7 +5,6 @@ import secrets
 from collections import defaultdict, deque
 import numpy as np
 import networkx as nx
-from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 
 from config import compute_packet_hash, make_mc_mac, make_node_charge_receipt_mac, _source_energy, DATA_PACKET_BITS

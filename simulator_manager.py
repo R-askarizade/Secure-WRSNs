@@ -78,7 +78,22 @@ class SimulatorManager:
             'Charging_Configuration_Frozen_Flag': True,
             'Data_Plane_Hybrid_Enabled_Flag': bool(
                 self.ablation.get('use_data_plane_hybrid_routing', True)),
-            'Data_Secondary_Replacement_Mode': 'replace_only_energy_dominant',
+            'Data_Secondary_Replacement_Mode': (
+                'energy_guarded_existing_plus_least_overlap_failover'),
+            'Critical_Require_Two_Routes_Flag': bool(
+                self.ablation.get('critical_require_two_routes', True)),
+            'Critical_Secondary_Selection_Mode': str(
+                self.ablation.get('critical_secondary_selection_mode',
+                                  'least_overlap_safest')),
+            'Critical_Synthesized_Secondary_Mode': str(
+                self.ablation.get('critical_synthesized_secondary_mode',
+                                  'failover')),
+            'Critical_Failover_Energy_Guard_Flag': bool(
+                self.ablation.get('critical_failover_energy_guard', True)),
+            'Critical_Failover_Min_Energy_Ratio': float(
+                self.ablation.get('critical_failover_min_energy_ratio', 0.65)),
+            'Critical_Failover_Reserve_Margin_Ratio': float(
+                self.ablation.get('critical_failover_reserve_margin_ratio', 0.05)),
             'Data_Route_Energy_Tolerance': float(
                 self.ablation.get('data_route_energy_tolerance', 0.0)),
             'Data_Route_Stress_Tolerance': float(
@@ -405,26 +420,256 @@ class SimulatorManager:
             out.append(cast(v))
         return out
 
+    @staticmethod
+    def _nonnegative_float(value, default=0.0):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not math.isfinite(number):
+            return float(default)
+        return max(0.0, number)
+
+    def _estimate_mobile_charger_count_cost_aware(self):
+        """Return the smallest performance-feasible fleet size and diagnostics.
+
+        The count is the maximum of five independent lower bounds: the legacy
+        node-to-charger ratio, aggregate energy balance, service-time capacity,
+        response-time coverage, and per-mission battery feasibility.  Because every charger has positive total
+        cost of ownership, the smallest feasible count is also the least-cost
+        feasible homogeneous fleet.  A budget can be reported as infeasible or
+        used as an explicit hard cap; the default performance-first policy never
+        reduces the legacy fleet size.
+        """
+        n = max(1, int(self.num_nodes))
+        width = max(float(self.network_size[0]), 1e-9)
+        height = max(float(self.network_size[1]), 1e-9)
+        area = width * height
+        diagonal = math.hypot(width, height)
+        tx_range = max(float(self.transmission_range), 1e-9)
+        speed = max(self._nonnegative_float(
+            self.ablation.get('mobile_charger_speed', 5.0), 5.0), 1e-9)
+        charging_rate = max(self._nonnegative_float(
+            self.ablation.get('charging_rate', 5.0), 5.0), 1e-12)
+        eta = float(np.clip(self.ablation.get(
+            'charging_energy_efficiency',
+            self.ablation.get('rf_energy_conversion_efficiency', 0.70)),
+            1e-6, 1.0))
+        utilization = float(np.clip(self.ablation.get(
+            'mobile_charger_service_utilization', 0.70), 0.05, 1.0))
+        safety = max(1.0, self._nonnegative_float(self.ablation.get(
+            'mobile_charger_count_safety_factor', 1.10), 1.10))
+
+        nodes_per_charger = max(1, int(self.ablation.get(
+            'mobile_charger_nodes_per_charger', 40)))
+        legacy_count = int(math.ceil(n / float(nodes_per_charger)))
+
+        explicit_node_power = self.ablation.get(
+            'mobile_charger_estimated_node_power_j_per_s', None)
+        if explicit_node_power is not None:
+            estimated_node_power = self._nonnegative_float(explicit_node_power)
+        else:
+            idle_power = self._nonnegative_float(
+                self.ablation.get('idle_sensing_power_j_per_s', 0.0))
+            event_rate = self._nonnegative_float(
+                self.ablation.get('event_rate_lambda', 0.0))
+            bits = max(1.0, self._nonnegative_float(
+                self.ablation.get('data_packet_bits', self.data_packet_bits),
+                self.data_packet_bits))
+            e_elec = self._nonnegative_float(
+                self.ablation.get('radio_e_elec_j_per_bit', 50e-9), 50e-9)
+            eps_fs = self._nonnegative_float(
+                self.ablation.get('radio_eps_fs_j_per_bit_m2', 10e-12), 10e-12)
+            expected_source_distance = 0.40 * diagonal
+            expected_hops = max(1.0, expected_source_distance / tx_range)
+            expected_hop_distance = min(tx_range, expected_source_distance /
+                                        expected_hops)
+            tx_energy = bits * (e_elec + eps_fs * expected_hop_distance ** 2)
+            rx_energy = bits * e_elec
+            path_energy = tx_energy + max(0.0, expected_hops - 1.0) * (
+                tx_energy + rx_energy)
+            estimated_node_power = idle_power + event_rate * path_energy
+
+        aggregate_demand_power = n * estimated_node_power * safety
+        effective_service_power = charging_rate * eta * utilization
+        energy_count = max(1, int(math.ceil(
+            aggregate_demand_power / max(effective_service_power, 1e-12))))
+
+        initial_energy = max(self._nonnegative_float(
+            getattr(self, 'sensor_initial_energy',
+                    self.ablation.get('initial_energy_override', 0.1)), 0.1),
+            1e-12)
+        recharge_fraction = float(np.clip(self.ablation.get(
+            'mobile_charger_average_recharge_fraction', 0.50), 0.0, 1.0))
+        request_fraction = float(np.clip(self.ablation.get(
+            'mobile_charger_expected_request_fraction', 0.25), 0.0, 1.0))
+        service_horizon = max(self._nonnegative_float(self.ablation.get(
+            'mobile_charger_service_horizon_s',
+            self.ablation.get('charge_deadline_horizon_s', 900.0)), 900.0),
+            1e-6)
+        reference_count = max(1, legacy_count, energy_count)
+        service_radius = math.sqrt(area / (math.pi * reference_count))
+        expected_travel_distance = (2.0 / 3.0) * service_radius
+        expected_travel_time = expected_travel_distance / speed
+        expected_charge_time = (initial_energy * recharge_fraction) / max(
+            charging_rate * eta, 1e-12)
+        dispatch_overhead = self._nonnegative_float(self.ablation.get(
+            'mobile_charger_dispatch_overhead_s', 0.0))
+        expected_mission_time = (
+            expected_travel_time + expected_charge_time + dispatch_overhead)
+        missions_per_horizon = n * request_fraction
+        time_count = max(1, int(math.ceil(
+            missions_per_horizon * expected_mission_time /
+            max(service_horizon * utilization, 1e-12))))
+
+        response_deadline = max(self._nonnegative_float(self.ablation.get(
+            'mobile_charger_response_deadline_s',
+            self.ablation.get('hard_deadline_margin_s', 90.0)), 90.0), 1e-6)
+        response_margin = self._nonnegative_float(self.ablation.get(
+            'mobile_charger_response_margin_s', 0.0))
+        travel_budget = max(0.0, response_deadline - expected_charge_time -
+                            dispatch_overhead - response_margin)
+        reachable_radius = speed * travel_budget
+        packing_efficiency = float(np.clip(self.ablation.get(
+            'mobile_charger_spatial_packing_efficiency', 0.65), 0.10, 1.0))
+        if reachable_radius <= 1e-12:
+            coverage_count = n
+        else:
+            coverage_count = max(1, int(math.ceil(
+                area / max(math.pi * reachable_radius ** 2 *
+                           packing_efficiency, 1e-12))))
+
+        min_count = max(1, int(self.ablation.get('min_mobile_chargers', 1)))
+        max_count = max(min_count, int(self.ablation.get(
+            'max_mobile_chargers', 8)))
+
+        capacity_mode = str(self.ablation.get(
+            'mobile_charger_capacity_mode', 'absolute')).strip().lower()
+        if capacity_mode in {'relative', 'sensor_relative', 'sensor-equivalent',
+                             'sensor_equivalent', 'node_relative', 'scaled'}:
+            eq_values = self._as_list(self.ablation.get(
+                'mobile_charger_sensor_equivalent_capacities', None),
+                default=[self.ablation.get(
+                    'mobile_charger_sensor_equivalent_capacity', 20.0)])
+            configured_capacity = min(
+                self._nonnegative_float(v) * initial_energy for v in eq_values)
+        else:
+            cap_values = self._as_list(self.ablation.get(
+                'mobile_charger_capacities', None),
+                default=[self.ablation.get('mobile_charger_capacity', 50000.0)])
+            configured_capacity = min(self._nonnegative_float(v)
+                                      for v in cap_values)
+        travel_cost = self._nonnegative_float(self.ablation.get(
+            'mobile_charger_travel_energy_cost_per_m', 0.1), 0.1)
+        reserve_ratio = float(np.clip(self.ablation.get(
+            'mc_reserve_ratio', 0.05), 0.0, 0.95))
+        usable_capacity = configured_capacity * (1.0 - reserve_ratio)
+        capacity_count = max(min_count, legacy_count, energy_count,
+                             time_count, coverage_count)
+        expected_mission_energy = float('inf')
+        for candidate_count in range(capacity_count, max_count + 1):
+            candidate_radius = math.sqrt(area / (math.pi * candidate_count))
+            candidate_distance = (2.0 / 3.0) * candidate_radius
+            candidate_mission_energy = (
+                2.0 * candidate_distance * travel_cost
+                + charging_rate * expected_charge_time)
+            if usable_capacity + 1e-12 >= candidate_mission_energy:
+                capacity_count = candidate_count
+                expected_mission_energy = candidate_mission_energy
+                break
+        else:
+            capacity_count = max_count + 1
+            candidate_radius = math.sqrt(area / (math.pi * max_count))
+            candidate_distance = (2.0 / 3.0) * candidate_radius
+            expected_mission_energy = (
+                2.0 * candidate_distance * travel_cost
+                + charging_rate * expected_charge_time)
+
+        raw_count = max(legacy_count, energy_count, time_count, coverage_count,
+                        capacity_count)
+        unconstrained_count = max(min_count, raw_count)
+        selected_count = min(max_count, unconstrained_count)
+        upper_bound_limited = unconstrained_count > max_count
+
+        purchase = self._nonnegative_float(self.ablation.get(
+            'mobile_charger_unit_purchase_cost', 0.0))
+        integration = self._nonnegative_float(self.ablation.get(
+            'mobile_charger_unit_integration_cost', 0.0))
+        annual_maintenance = self._nonnegative_float(self.ablation.get(
+            'mobile_charger_annual_maintenance_cost', 0.0))
+        life_years = max(1.0, self._nonnegative_float(self.ablation.get(
+            'mobile_charger_economic_life_years', 3.0), 3.0))
+        unit_tco = purchase + integration + annual_maintenance * life_years
+        budget_value = self.ablation.get('mobile_charger_total_budget', None)
+        budget = (None if budget_value in (None, '', 'none', 'None')
+                  else self._nonnegative_float(budget_value))
+        budget_count = None
+        budget_feasible = True
+        if budget is not None and unit_tco > 0.0:
+            budget_count = int(math.floor(budget / unit_tco))
+            budget_feasible = budget_count >= selected_count
+            policy = str(self.ablation.get(
+                'mobile_charger_budget_policy', 'performance_first')).strip().lower()
+            if policy in {'hard_cap', 'budget_first', 'strict_budget'}:
+                selected_count = max(min_count, min(selected_count, budget_count))
+
+        diagnostics = {
+            'formula': 'max(legacy,energy_balance,service_time,response_coverage,mission_capacity)',
+            'legacy_count': int(legacy_count),
+            'energy_balance_count': int(energy_count),
+            'service_time_count': int(time_count),
+            'response_coverage_count': int(coverage_count),
+            'mission_capacity_count': int(capacity_count),
+            'configured_min_capacity_j': float(configured_capacity),
+            'usable_capacity_after_reserve_j': float(usable_capacity),
+            'expected_mission_energy_j': float(expected_mission_energy),
+            'mission_capacity_feasible': bool(capacity_count <= max_count),
+            'unconstrained_count': int(unconstrained_count),
+            'selected_count': int(max(1, selected_count)),
+            'estimated_node_power_j_per_s': float(estimated_node_power),
+            'aggregate_demand_power_j_per_s': float(aggregate_demand_power),
+            'effective_service_power_j_per_s': float(effective_service_power),
+            'expected_mission_time_s': float(expected_mission_time),
+            'response_reachable_radius_m': float(reachable_radius),
+            'unit_tco': float(unit_tco),
+            'fleet_tco': float(unit_tco * max(1, selected_count)),
+            'budget': budget,
+            'budget_count': budget_count,
+            'budget_feasible': bool(budget_feasible),
+            'upper_bound_limited': bool(upper_bound_limited),
+        }
+        return max(1, int(selected_count)), diagnostics
+
     def _resolve_mobile_charger_count(self, capacity_values):
         mode = str(self.ablation.get('mobile_charger_selection_mode',
                                      self.ablation.get('mc_selection_mode', 'hardcoded'))).strip().lower()
         explicit = self.ablation.get('num_mobile_chargers',
                                      self.ablation.get('mobile_charger_count', None))
-        if mode in ('dynamic', 'auto', 'adaptive'):
-            nodes_per_charger = int(
-                max(1, int(self.ablation.get('mobile_charger_nodes_per_charger', 40))))
-            count = int(math.ceil(max(1, self.num_nodes) /
-                        float(nodes_per_charger)))
-            count = max(int(self.ablation.get(
-                'min_mobile_chargers', 1)), count)
-            count = min(int(self.ablation.get(
-                'max_mobile_chargers', 8)), count)
-            return max(1, count)
+        if mode in ('dynamic', 'auto', 'adaptive', 'cost_aware', 'economic'):
+            count, diagnostics = self._estimate_mobile_charger_count_cost_aware()
+            self.mobile_charger_count_diagnostics = diagnostics
+            if hasattr(self, 'metrics'):
+                self.metrics.experiment_parameters.update({
+                    f'MC_Count_{key}': value for key, value in diagnostics.items()
+                })
+            return count
+        self.mobile_charger_count_diagnostics = {
+            'formula': 'hardcoded_or_capacity_list',
+            'selected_count': None,
+        }
         if explicit is not None:
-            return max(1, int(explicit))
-        if len(capacity_values) > 1:
-            return len(capacity_values)
-        return 1
+            count = max(1, int(explicit))
+        elif len(capacity_values) > 1:
+            count = len(capacity_values)
+        else:
+            count = 1
+        self.mobile_charger_count_diagnostics['selected_count'] = int(count)
+        if hasattr(self, 'metrics'):
+            self.metrics.experiment_parameters.update({
+                'MC_Count_formula': 'hardcoded_or_capacity_list',
+                'MC_Count_selected_count': int(count),
+            })
+        return count
 
     def _resolve_mobile_charger_capacities(self, count, capacity_values):
         mode = str(self.ablation.get(
@@ -729,10 +974,12 @@ class SimulatorManager:
             target_node = self.nodes[n_id]
             target_node._consume_energy(rx_bytes=POLICY_SIZE)
             target_node.update_policies_from_bs(
-                table['primary'], table['secondary'], adaptive_threshold)
+                table['primary'], table['secondary'], adaptive_threshold,
+                secondary_mode=table.get('secondary_mode', 'redundant'))
             data_table = initial_data_tables.get(n_id, {})
             target_node.update_data_routes(
-                data_table.get('primary'), data_table.get('secondary'))
+                data_table.get('primary'), data_table.get('secondary'),
+                secondary_mode=data_table.get('secondary_mode', 'redundant'))
             target_node.temp_parent = None
             target_node.hop_count_to_bs = float('inf')
             self.metrics.update_packet_transmission(
@@ -761,8 +1008,14 @@ class SimulatorManager:
     def _record_energy_sentinel_requests(self):
         if not self.energy_experiment_active:
             return
+        revival_enabled = bool(self.ablation.get(
+            'enable_dead_node_revival', True))
         for nid, node in self.nodes.items():
-            if nid == self.BS_ID or node.status != 'ALIVE':
+            if nid == self.BS_ID:
+                continue
+            if node.status not in ('ALIVE', 'DEAD'):
+                continue
+            if node.status == 'DEAD' and not revival_enabled:
                 continue
             if node.E_current <= node.E_critical:
                 self.metrics.record_energy_critical(nid, self.current_time)
@@ -778,6 +1031,8 @@ class SimulatorManager:
                             float(st.get('energy_last_reported', actual_e)), actual_e)
                         st['energy_last_report_time'] = float(
                             self.current_time)
+                        st['physical_node_status'] = str(node.status)
+                        st['revival_requested'] = bool(node.status == 'DEAD')
                     self.bs.pending_sos_requests.add(nid)
 
     def service_mobile_charger(self):
@@ -899,6 +1154,74 @@ class SimulatorManager:
         if getattr(target_node, 'is_cluster', False):
             return float(target_node.centroid_x), float(target_node.centroid_y)
         return float(target_node.x), float(target_node.y)
+
+    def _candidate_target_object(self, candidate):
+        if isinstance(candidate, (int, np.integer)):
+            return self.nodes.get(int(candidate))
+        return candidate
+
+    def _target_is_emergency(self, candidate):
+        target = self._candidate_target_object(candidate)
+        if target is None:
+            return False
+        return any(
+            node.node_id in self.bs.pending_sos_requests
+            or self.bs.is_deadline_rescue_node(node.node_id, self.current_time)
+            or node.status == 'DEAD'
+            for node in self._target_nodes(target)
+        )
+
+    def _stable_region_owner_id(self, candidate):
+        target = self._candidate_target_object(candidate)
+        chargers = sorted(self.mobile_chargers, key=lambda mc: int(mc.mc_id))
+        if target is None or not chargers:
+            return None
+        tx, ty = self._target_coords(target)
+        cx = float(self.nodes[self.BS_ID].x)
+        cy = float(self.nodes[self.BS_ID].y)
+        if math.hypot(tx - cx, ty - cy) <= 1e-12:
+            return int(chargers[0].mc_id)
+        angle = (math.atan2(ty - cy, tx - cx) + 2.0 * math.pi) % (
+            2.0 * math.pi)
+        index = min(len(chargers) - 1, int(
+            math.floor(angle / (2.0 * math.pi) * len(chargers))))
+        return int(chargers[index].mc_id)
+
+    def _target_interference_radius(self, target):
+        target = self._candidate_target_object(target)
+        if target is None:
+            return 0.0
+        if getattr(target, 'is_cluster', False):
+            return max(0.0, float(self.ablation.get(
+                'rf_charging_radius', 25.0)))
+        return 0.5 * max(0.0, float(self.ablation.get(
+            'mobile_charger_physical_footprint_m', 0.0)))
+
+    def _targets_spatially_conflict(self, first, second):
+        a = self._candidate_target_object(first)
+        b = self._candidate_target_object(second)
+        if a is None or b is None:
+            return False
+        ax, ay = self._target_coords(a)
+        bx, by = self._target_coords(b)
+        safe_gap = max(0.0, float(self.ablation.get(
+            'mobile_charger_safe_distance_m', 0.0)))
+        required = (self._target_interference_radius(a) +
+                    self._target_interference_radius(b) + safe_gap)
+        if required <= 0.0:
+            return False
+        return math.hypot(ax - bx, ay - by) + 1e-9 < required
+
+    def _candidate_has_active_interference_conflict(self, candidate,
+                                                     reserved_targets=()):
+        if not self.ablation.get(
+                'use_interference_safe_multi_mc_dispatch', False):
+            return False
+        for mission in self.active_charger_missions.values():
+            if self._targets_spatially_conflict(candidate, mission.get('target')):
+                return True
+        return any(self._targets_spatially_conflict(candidate, other)
+                   for other in reserved_targets)
 
     def _relative_mc_feasibility_guard_enabled(self):
         return bool(self.ablation.get('use_universal_mc_feasibility_guard', True))
@@ -1512,8 +1835,11 @@ class SimulatorManager:
             if getattr(candidate, 'is_cluster', False):
                 if not any(node.node_id in active_ids for node in candidate.nodes):
                     next_candidates.append(candidate)
-            elif candidate in self.nodes and candidate not in active_ids and self.nodes[candidate].status == 'ALIVE':
-                next_candidates.append(self.nodes[candidate])
+            elif candidate in self.nodes and candidate not in active_ids:
+                eligible_status = ('ALIVE', 'DEAD') if self.ablation.get(
+                    'enable_dead_node_revival', True) else ('ALIVE',)
+                if self.nodes[candidate].status in eligible_status:
+                    next_candidates.append(self.nodes[candidate])
         next_features = [self.charger_dqn.feature_for(
             charger.x, charger.y, candidate, self.bs.node_states,
             mission['network_diag']) for candidate in next_candidates]
@@ -1633,7 +1959,9 @@ class SimulatorManager:
         for node in self._target_nodes(target_node):
             emergency = bool(selected_emergency or self.bs.is_deadline_rescue_node(
                 node.node_id, mission_start_time))
-            if node.status == 'ALIVE' and self.bs.validate_charging_request(
+            eligible_status = ('ALIVE', 'DEAD') if self.ablation.get(
+                'enable_dead_node_revival', True) else ('ALIVE',)
+            if node.status in eligible_status and self.bs.validate_charging_request(
                     node.node_id, emergency=emergency):
                 valid_nodes.append(node)
         if not valid_nodes:
@@ -1758,8 +2086,11 @@ class SimulatorManager:
             for candidate in self.bs.secure_charging_queue:
                 if getattr(candidate, 'is_cluster', False):
                     next_candidates.append(candidate)
-                elif candidate in self.nodes and self.nodes[candidate].status == 'ALIVE':
-                    next_candidates.append(self.nodes[candidate])
+                elif candidate in self.nodes:
+                    eligible_status = ('ALIVE', 'DEAD') if self.ablation.get(
+                        'enable_dead_node_revival', True) else ('ALIVE',)
+                    if self.nodes[candidate].status in eligible_status:
+                        next_candidates.append(self.nodes[candidate])
             next_features = [self.charger_dqn.feature_for(
                 charger.x, charger.y, candidate, self.bs.node_states, network_diag)
                 for candidate in next_candidates]
@@ -1831,15 +2162,56 @@ class SimulatorManager:
         assignments = []
         remaining_candidates = list(candidates)
         assigned_ids = set()
+        reserved_targets = []
+        stable_regions = bool(self.ablation.get(
+            'use_stable_charger_regions', False))
+        interference_guard = bool(self.ablation.get(
+            'use_interference_safe_multi_mc_dispatch', False))
         for charger in sorted(idle_chargers, key=lambda mc: int(mc.mc_id)):
+            allowed = []
+            emergency_conflicts = []
+            for candidate in remaining_candidates:
+                conflict = self._candidate_has_active_interference_conflict(
+                    candidate, reserved_targets)
+                if not conflict:
+                    allowed.append(candidate)
+                elif self._target_is_emergency(candidate):
+                    emergency_conflicts.append(candidate)
+                else:
+                    self.metrics.mc_interference_conflict_deferrals += 1
+
+            candidate_pool = allowed if allowed else emergency_conflicts
+            if not candidate_pool:
+                continue
+            if stable_regions:
+                regional = [candidate for candidate in candidate_pool
+                            if self._stable_region_owner_id(candidate)
+                            == int(charger.mc_id)]
+                if regional:
+                    candidate_pool = regional
+
             target = self._select_target_for_charger(
-                charger, remaining_candidates, assigned_ids)
+                charger, candidate_pool, assigned_ids)
             if target is None:
                 continue
             target_ids = {node.node_id for node in self._target_nodes(target)}
             if target_ids & in_service:
                 continue
+            if (interference_guard and
+                    self._candidate_has_active_interference_conflict(
+                        target, reserved_targets)):
+                # Only DEAD/SOS/deadline-rescue targets may override the guard.
+                if not self._target_is_emergency(target):
+                    self.metrics.mc_interference_conflict_deferrals += 1
+                    continue
+                self.metrics.mc_interference_emergency_overrides += 1
+            if stable_regions:
+                owner_id = self._stable_region_owner_id(target)
+                if owner_id is not None and owner_id != int(charger.mc_id):
+                    self.metrics.mc_cross_region_assignments += 1
+
             assignments.append((charger, target))
+            reserved_targets.append(target)
             assigned_ids.add(getattr(target, 'node_id', None))
             in_service.update(target_ids)
             remaining_candidates = [
@@ -1876,7 +2248,9 @@ class SimulatorManager:
             if nid == self.BS_ID or not self.bs.validate_charging_request(nid):
                 continue
             node = self.nodes.get(nid)
-            if node is None or node.status != "ALIVE":
+            eligible_status = ('ALIVE', 'DEAD') if self.ablation.get(
+                'enable_dead_node_revival', True) else ('ALIVE',)
+            if node is None or node.status not in eligible_status:
                 continue
             E_initial = state['E_initial']
             E_est = state.get('E_est', E_initial)
@@ -2219,6 +2593,57 @@ class SimulatorManager:
             'MC_Trust_Minimum_End': float(np.min(mc_trust_values)) if mc_trust_values else 1.0,
         })
 
+    def _critical_failover_energy_feasible(self, route):
+        """Return whether failover preserves per-node energy reserves."""
+        if not self.ablation.get('critical_failover_energy_guard', True):
+            return True
+        route = list(route or [])
+        if len(route) < 2:
+            return False
+        min_ratio = max(0.0, min(1.0, float(self.ablation.get(
+            'critical_failover_min_energy_ratio', 0.15))))
+        margin_ratio = max(0.0, float(self.ablation.get(
+            'critical_failover_reserve_margin_ratio', 0.02)))
+        ack_bits = float(self.ack_packet_bits)
+
+        def tx_cost(node, bits, distance):
+            if distance <= float(node.d0):
+                return bits * (
+                    float(node.E_elec) + float(node.eps_fs) * distance ** 2)
+            return bits * (
+                float(node.E_elec) + float(node.eps_mp) * distance ** 4)
+
+        projected = defaultdict(float)
+        for u, v in zip(route[:-1], route[1:]):
+            sender = self.nodes.get(u)
+            receiver = self.nodes.get(v)
+            if sender is None or receiver is None:
+                return False
+            distance = math.hypot(
+                float(sender.x) - float(receiver.x),
+                float(sender.y) - float(receiver.y))
+            if u != self.BS_ID:
+                projected[u] += tx_cost(
+                    sender, self.data_packet_bits, distance)
+                projected[u] += ack_bits * float(sender.E_elec)
+            if v != self.BS_ID:
+                projected[v] += (
+                    self.data_packet_bits * float(receiver.E_elec))
+                projected[v] += tx_cost(receiver, ack_bits, distance)
+
+        for nid, energy_cost in projected.items():
+            node = self.nodes.get(nid)
+            if (node is None or
+                    str(getattr(node, 'status', 'DEAD')).upper() != 'ALIVE'):
+                return False
+            e_max = max(float(node.E_max), 1e-12)
+            reserve = max(
+                float(getattr(node, 'E_critical', 0.0)),
+                (min_ratio + margin_ratio) * e_max)
+            if float(node.E_current) - energy_cost <= reserve + 1e-15:
+                return False
+        return True
+
     def _trace_packet_path(self, source_id, seq_num, is_critical, payload_value,
                            source_packet=None, seq_override=None,
                            count_generated=True, allow_source_replay=True):
@@ -2251,6 +2676,11 @@ class SimulatorManager:
         table = (self.bs.data_routing_tables.get(source_id, {})
                  if self.bs.data_routing_tables else
                  self.bs.routing_tables.get(source_id, {}))
+        secondary_path_for_mode = list(table.get('secondary_path') or [])
+        secondary_mode = str(table.get(
+            'secondary_mode', 'redundant')).strip().lower()
+        if secondary_mode not in {'redundant', 'failover'}:
+            secondary_mode = 'redundant'
         if is_critical and self.ablation.get("use_critical_multipath_routing", False):
             candidate_paths = table.get('critical_paths') or []
             if not candidate_paths:
@@ -2283,12 +2713,32 @@ class SimulatorManager:
         delivered_fragments = 0
         first_success_delay = None
         first_delivered_packet = None
+        attempted_failover = 0
+        successful_failover = 0
 
         for path_index, p_info in enumerate(paths_to_trace):
             route = list(p_info['path'])
             if not route or route[0] != source_id or route[-1] != self.BS_ID:
                 continue
-            if is_critical and path_index >= 2:
+            is_failover_route = (
+                is_critical and secondary_mode == 'failover'
+                and route == secondary_path_for_mode
+            )
+            if is_failover_route and delivered_fragments > 0:
+                continue
+            if is_failover_route:
+                if not self._critical_failover_energy_feasible(route):
+                    self.metrics.critical_failover_energy_guard_deferrals += 1
+                    continue
+                attempted_failover += 1
+                first_hop = route[1] if len(route) > 1 else None
+                if first_hop is not None:
+                    self.nodes[source_id]._consume_energy(
+                        tx_bytes=self.data_packet_bytes,
+                        tx_bits=self.data_packet_bits,
+                        distance=self.nodes[source_id]._distance_to_next_hop(
+                            first_hop))
+            elif is_critical and path_index >= 2:
                 self.nodes[source_id]._consume_energy(
                     tx_bytes=self.data_packet_bytes, tx_bits=self.data_packet_bits, distance=30.0)
 
@@ -2372,6 +2822,8 @@ class SimulatorManager:
             if not packet_dropped and path_log[-1] == self.BS_ID:
                 simulated_delay = len(path_log) * 0.100 + malicious_delay_s
                 delivered_fragments += 1
+                if is_failover_route:
+                    successful_failover += 1
                 if first_success_delay is None or simulated_delay < first_success_delay:
                     first_success_delay = simulated_delay
                 packet_data = dict(packet)
@@ -2382,12 +2834,15 @@ class SimulatorManager:
                     first_delivered_packet = dict(packet_data)
 
         if is_critical and self.ablation.get("use_critical_multipath_routing", False):
-            attempted_redundant = max(0, len(paths_to_trace) - 1)
-            accepted_redundant = max(0, delivered_fragments - 1)
-            rejected_redundant = max(
-                0, attempted_redundant - accepted_redundant)
-            self.metrics.critical_redundant_copy_accepted += accepted_redundant
-            self.metrics.critical_redundant_copy_rejected += rejected_redundant
+            if secondary_mode != 'failover':
+                attempted_redundant = max(0, len(paths_to_trace) - 1)
+                accepted_redundant = max(0, delivered_fragments - 1)
+                rejected_redundant = max(
+                    0, attempted_redundant - accepted_redundant)
+                self.metrics.critical_redundant_copy_accepted += accepted_redundant
+                self.metrics.critical_redundant_copy_rejected += rejected_redundant
+            self.metrics.critical_failover_attempts += int(attempted_failover)
+            self.metrics.critical_failover_successes += int(successful_failover)
 
         if delivered_fragments >= required_fragments:
             self.metrics.update_packet_transmission(
@@ -2435,7 +2890,8 @@ class SimulatorManager:
                 self.nodes[n_id].update_policies_from_bs(
                     primary_hop=table.get('primary'),
                     secondary_hop=table.get('secondary'),
-                    new_threshold=new_adaptive_th
+                    new_threshold=new_adaptive_th,
+                    secondary_mode=table.get('secondary_mode', 'redundant')
                 )
 
         # Push DATA-only next hops separately.  No charging/control state is
@@ -2445,4 +2901,5 @@ class SimulatorManager:
             if n_id in self.nodes:
                 self.nodes[n_id].update_data_routes(
                     primary_hop=table.get('primary'),
-                    secondary_hop=table.get('secondary'))
+                    secondary_hop=table.get('secondary'),
+                    secondary_mode=table.get('secondary_mode', 'redundant'))

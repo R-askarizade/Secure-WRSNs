@@ -32,6 +32,10 @@ class MetricsCollector:
         self.alive_nodes = total_nodes
         self.node_death_times = {}
         self._currently_dead_nodes = set()
+        self._current_death_start_times = {}
+        self.node_revival_count = 0
+        self.node_revival_times = []
+        self.node_dead_durations = []
         self.network_residual_energy_history = []
         self.mc_travel_distance = 0.0
         self.mc_travel_energy = 0.0
@@ -124,6 +128,9 @@ class MetricsCollector:
         self.critical_secondary_path_available = 0
         self.critical_redundant_copy_accepted = 0
         self.critical_redundant_copy_rejected = 0
+        self.critical_failover_attempts = 0
+        self.critical_failover_successes = 0
+        self.critical_failover_energy_guard_deferrals = 0
         self.sparse_topology_no_backup_count = 0
 
         self.mc_replay_rejections = 0
@@ -191,6 +198,9 @@ class MetricsCollector:
         self.charging_service_pool_admissions = 0
         self.charging_plus_pool_admissions = 0
         self.charging_opportunistic_plus_charges = 0
+        self.mc_interference_conflict_deferrals = 0
+        self.mc_interference_emergency_overrides = 0
+        self.mc_cross_region_assignments = 0
 
         # [INNOVATION] Hybrid Hierarchical Routing & Fuzzy Clustering Metrics
         self.adaptive_k_opts = []
@@ -243,12 +253,14 @@ class MetricsCollector:
         self.fn += fn_increment
 
     def record_node_death(self, node_id, current_time):
+        now = float(current_time)
         first_death = node_id not in self.node_death_times
         was_currently_dead = node_id in self._currently_dead_nodes
         if first_death:
-            self.node_death_times[node_id] = float(current_time)
+            self.node_death_times[node_id] = now
         if not was_currently_dead:
             self._currently_dead_nodes.add(node_id)
+            self._current_death_start_times[node_id] = now
             self.alive_nodes = max(0, self.alive_nodes - 1)
         if first_death and node_id in self._critical_nodes_seen:
             self.energy_critical_node_deaths += 1
@@ -257,8 +269,14 @@ class MetricsCollector:
 
     def record_node_revival(self, node_id, current_time=None):
         if node_id in self._currently_dead_nodes:
+            now = float(self.current_sim_time if current_time is None else current_time)
             self._currently_dead_nodes.discard(node_id)
             self.alive_nodes = min(self.total_nodes, self.alive_nodes + 1)
+            self.node_revival_count += 1
+            self.node_revival_times.append(now)
+            death_start = self._current_death_start_times.pop(node_id, None)
+            if death_start is not None:
+                self.node_dead_durations.append(max(0.0, now - float(death_start)))
 
     def get_charging_request_wait_time(self, node_id, current_time):
         first_seen = self._charging_request_first_seen_time.get(node_id)
@@ -616,6 +634,13 @@ class MetricsCollector:
         summary['MC_Avoided_Node_Deaths'] = self.mc_avoided_node_deaths
         summary['Energy_Critical_Node_Events'] = self.energy_critical_node_events
         summary['Energy_Critical_Node_Deaths'] = self.energy_critical_node_deaths
+        summary['Alive_Nodes_End'] = int(self.alive_nodes)
+        summary['Ever_Dead_Node_Count'] = int(len(self.node_death_times))
+        summary['Node_Revival_Count'] = int(self.node_revival_count)
+        summary['Node_Revival_Rate'] = self._safe_rate(
+            self.node_revival_count, len(self.node_death_times), undefined=np.nan)
+        summary['Mean_Node_Dead_Duration_s'] = float(
+            np.mean(self.node_dead_durations)) if self.node_dead_durations else 0.0
 
         # ADAPTIVE QIFL-DQN CHARGING EXPORTS
         summary['Adaptive_Charge_Threshold_Avg'] = float(np.mean(
@@ -628,6 +653,9 @@ class MetricsCollector:
             np.mean(self.sos_threshold_energies)) if self.sos_threshold_energies else 0.0
         summary['Charging_KMeans_Clusters_Avg'] = float(np.mean(
             self.charging_kmeans_cluster_counts)) if self.charging_kmeans_cluster_counts else 0.0
+        # Backward-compatible alias: the charging implementation is radius-
+        # constrained spatial grouping, not mathematical K-means.
+        summary['Charging_Spatial_Clusters_Avg'] = summary['Charging_KMeans_Clusters_Avg']
         summary['Charging_Cluster_Assigned_Nodes_Avg'] = float(np.mean(
             self.charging_cluster_assigned_node_counts)) if self.charging_cluster_assigned_node_counts else 0.0
         summary['DQN_Routing_Decisions'] = int(self.dqn_routing_decisions)
@@ -792,6 +820,12 @@ class MetricsCollector:
             self.critical_secondary_path_available, self.critical_secondary_path_opportunities)
         summary['Critical_Redundant_Copy_Accepted_Count'] = self.critical_redundant_copy_accepted
         summary['Critical_Redundant_Copy_Rejected_Count'] = self.critical_redundant_copy_rejected
+        summary['Critical_Failover_Attempts'] = int(self.critical_failover_attempts)
+        summary['Critical_Failover_Successes'] = int(self.critical_failover_successes)
+        summary['Critical_Failover_Success_Rate'] = self._safe_rate(
+            self.critical_failover_successes, self.critical_failover_attempts)
+        summary['Critical_Failover_Energy_Guard_Deferrals'] = int(
+            self.critical_failover_energy_guard_deferrals)
         summary['Sparse_Topology_NoBackup_Count'] = self.sparse_topology_no_backup_count
 
         summary['RF_Cluster_Charge_Events'] = int(
@@ -832,6 +866,12 @@ class MetricsCollector:
             self, 'charging_plus_pool_admissions', 0))
         summary['Charging_Opportunistic_Plus_Charges'] = int(getattr(
             self, 'charging_opportunistic_plus_charges', 0))
+        summary['MC_Interference_Conflict_Deferrals'] = int(getattr(
+            self, 'mc_interference_conflict_deferrals', 0))
+        summary['MC_Interference_Emergency_Overrides'] = int(getattr(
+            self, 'mc_interference_emergency_overrides', 0))
+        summary['MC_Cross_Region_Assignments'] = int(getattr(
+            self, 'mc_cross_region_assignments', 0))
 
         for key, value in sorted(self.experiment_parameters.items()):
             safe_key = re.sub(r'[^0-9A-Za-z_]+', '_', str(key)).strip('_')

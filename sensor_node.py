@@ -26,14 +26,20 @@ class SensorNode:
         self.E_current = initial_energy
         self.E_critical = initial_energy * 0.15
         self.status = "ALIVE"
+        self.enable_dead_node_revival = bool(
+            (attack_config or {}).get('enable_dead_node_revival', True))
+        self.dead_node_revival_min_energy_ratio = max(0.0, min(1.0, float(
+            (attack_config or {}).get('dead_node_revival_min_energy_ratio', 0.0))))
 
         self.primary_next_hop = None
         self.secondary_next_hop = None
+        self.secondary_route_mode = 'redundant'
         # DATA-plane routes are separate from the original control/charging
         # routes.  This prevents clustered routing from changing SOS/control
         # energy or any mobile-charger decision input.
         self.data_primary_next_hop = None
         self.data_secondary_next_hop = None
+        self.data_secondary_route_mode = 'redundant'
         self.adaptive_threshold = float('inf')
 
         self.inactivity_timer = 0
@@ -321,6 +327,10 @@ class SensorNode:
             if is_data and self.data_secondary_next_hop is not None
             else self.secondary_next_hop
         )
+        secondary_mode = (
+            self.data_secondary_route_mode
+            if is_data else self.secondary_route_mode
+        )
 
         if primary_hop is not None:
             self._consume_energy(
@@ -328,7 +338,8 @@ class SensorNode:
                 tx_bits=packet.get("size_bits"),
                 distance=self._distance_to_next_hop(primary_hop))
         if (is_critical and secondary_hop is not None
-                and secondary_hop != primary_hop):
+                and secondary_hop != primary_hop
+                and str(secondary_mode).strip().lower() == 'redundant'):
             self._consume_energy(
                 tx_bytes=packet["size_bytes"],
                 tx_bits=packet.get("size_bits"),
@@ -510,7 +521,11 @@ class SensorNode:
         before = max(0.0, float(self.E_current))
         self.E_current = min(float(self.E_max), before + injected_energy)
         actual = max(0.0, float(self.E_current) - before)
-        if actual > 0.0 and self.status == "DEAD":
+        revival_threshold = self.dead_node_revival_min_energy_ratio * max(
+            float(self.E_max), 0.0)
+        if (self.status == "DEAD" and self.enable_dead_node_revival
+                and self.E_current + 1e-15 >= revival_threshold
+                and actual > 0.0):
             self.status = "ALIVE"
             if hasattr(self.metrics, 'record_node_revival'):
                 self.metrics.record_node_revival(
@@ -560,12 +575,25 @@ class SensorNode:
     def _reset_inactivity_timer(self, current_time):
         self.last_activity_time = current_time
 
-    def update_policies_from_bs(self, primary_hop, secondary_hop, new_threshold):
+    @staticmethod
+    def _normalize_secondary_mode(mode, secondary_hop):
+        if secondary_hop is None:
+            return 'none'
+        normalized = str(mode or 'redundant').strip().lower()
+        return normalized if normalized in {'redundant', 'failover'} else 'redundant'
+
+    def update_policies_from_bs(self, primary_hop, secondary_hop, new_threshold,
+                                secondary_mode='redundant'):
         self.primary_next_hop = primary_hop
         self.secondary_next_hop = secondary_hop
+        self.secondary_route_mode = self._normalize_secondary_mode(
+            secondary_mode, secondary_hop)
         self.adaptive_threshold = new_threshold
 
-    def update_data_routes(self, primary_hop, secondary_hop):
+    def update_data_routes(self, primary_hop, secondary_hop,
+                           secondary_mode='redundant'):
         """Update DATA-only next hops without touching control/charging state."""
         self.data_primary_next_hop = primary_hop
         self.data_secondary_next_hop = secondary_hop
+        self.data_secondary_route_mode = self._normalize_secondary_mode(
+            secondary_mode, secondary_hop)
