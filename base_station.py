@@ -259,14 +259,15 @@ class BaseStation:
             self.metrics.fixed_charger_active_nodes = 0
             return
 
-        eps_values = [self._effective_depletion_rate(
-            nid) for nid in candidates]
+        eps_by_node = {
+            nid: self._effective_depletion_rate(nid) for nid in candidates
+        }
         relay_values = [float(relay_load.get(nid, 0)) for nid in candidates]
-        eps_max = max(eps_values, default=0.0)
+        eps_max = max(eps_by_node.values(), default=0.0)
         relay_max = max(relay_values, default=0.0)
 
         def bottleneck_score(nid):
-            eps = self._effective_depletion_rate(nid)
+            eps = eps_by_node[nid]
             eps_norm = eps / eps_max if eps_max > 0.0 else 0.0
             relay_norm = relay_load.get(
                 nid, 0) / relay_max if relay_max > 0.0 else 0.0
@@ -632,8 +633,7 @@ class BaseStation:
         return W_Hybrid
 
     def _compute_fitness_value(self):
-        nodes = list(self.node_states.keys())
-        valid_nodes = [n for n in nodes if n != self.BS_ID]
+        valid_nodes = [n for n in self.node_states if n != self.BS_ID]
         dynamic_weights = self._calculate_hybrid_weights(valid_nodes)
         self.current_dynamic_weights = dynamic_weights
         try:
@@ -642,16 +642,18 @@ class BaseStation:
         except Exception:
             pass
 
+        use_security_veto = self.ablation.get(
+            'use_security_veto_aggregation', True)
         for nid in valid_nodes:
-            if self.node_states[nid].get('status') == 'BLACKLISTED':
-                self.node_states[nid]['FE'] = 0.0
+            state = self.node_states[nid]
+            if state.get('status') == 'BLACKLISTED':
+                state['FE'] = 0.0
                 continue
-            T_vec = self.node_states[nid]['trust_vector']
-            T1, T2, T3, T4, T5 = T_vec
-            weighted_sum = float(np.dot(dynamic_weights, T_vec))
-            veto_multiplier = min(T1, T2) if self.ablation.get(
-                'use_security_veto_aggregation', True) else 1.0
-            self.node_states[nid]['FE'] = weighted_sum * veto_multiplier
+            trust_vector = state['trust_vector']
+            weighted_sum = float(np.dot(dynamic_weights, trust_vector))
+            veto_multiplier = min(
+                trust_vector[0], trust_vector[1]) if use_security_veto else 1.0
+            state['FE'] = weighted_sum * veto_multiplier
 
     def control_plane_epoch(self):
         old_h = self.RISK_HYSTERESIS_EPOCHS
@@ -860,13 +862,10 @@ class BaseStation:
 
         culprit_drop_per_path = {}
         for p in path_drop_counts.keys():
-            best_culprit = None
-            max_part = -1
-            for nid in p[1:-1]:
-                if node_drop_participation[nid] > max_part:
-                    max_part = node_drop_participation[nid]
-                    best_culprit = nid
-            culprit_drop_per_path[p] = best_culprit
+            internal = p[1:-1]
+            culprit_drop_per_path[p] = (
+                max(internal, key=node_drop_participation.__getitem__)
+                if internal else None)
 
         for p, d_count in path_drop_counts.items():
             culprit = culprit_drop_per_path.get(p)
@@ -901,13 +900,10 @@ class BaseStation:
 
         culprit_tamper_per_path = {}
         for p in path_tamper_counts.keys():
-            best_culprit = None
-            max_part = -1
-            for nid in p[1:-1]:
-                if node_tamper_participation[nid] > max_part:
-                    max_part = node_tamper_participation[nid]
-                    best_culprit = nid
-            culprit_tamper_per_path[p] = best_culprit
+            internal = p[1:-1]
+            culprit_tamper_per_path[p] = (
+                max(internal, key=node_tamper_participation.__getitem__)
+                if internal else None)
 
         identified_tamperers = set(culprit_tamper_per_path.values())
         identified_tamperers.discard(None)

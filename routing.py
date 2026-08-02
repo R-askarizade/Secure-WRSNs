@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+from heapq import heappop, heappush
+from itertools import count
 from collections import Counter, defaultdict
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -8,6 +10,79 @@ import networkx as nx
 import numpy as np
 
 from config import DATA_PACKET_BITS, DATA_PACKET_BYTES
+
+
+def _dijkstra_targets_exact(graph, source, targets, weight='weight', *, paths=False):
+    """NetworkX-equivalent Dijkstra, stopped after requested targets settle.
+
+    The relaxation order and floating-point operations mirror NetworkX's
+    single-source Dijkstra implementation. Only unnecessary exploration after
+    all requested targets are final is omitted.
+    """
+    requested = set(targets)
+    if not requested:
+        return ({}, {}) if paths else {}
+    if source not in graph:
+        raise nx.NodeNotFound(f"Node {source} not found in graph")
+
+    if callable(weight):
+        weight_fn = weight
+    elif graph.is_multigraph():
+        weight_fn = lambda u, v, data: min(
+            attr.get(weight, 1) for attr in data.values())
+    else:
+        weight_fn = lambda u, v, data: data.get(weight, 1)
+
+    adjacency = graph._adj
+    final = {}
+    seen = {source: 0}
+    predecessor = {} if paths else None
+    counter = count()
+    fringe = [(0, next(counter), source)]
+    remaining = set(requested)
+
+    while fringe:
+        dist_v, _, node = heappop(fringe)
+        if node in final:
+            continue
+        final[node] = dist_v
+        remaining.discard(node)
+        if not remaining:
+            break
+
+        for neighbor, edge_data in adjacency[node].items():
+            cost = weight_fn(node, neighbor, edge_data)
+            if cost is None:
+                continue
+            candidate = dist_v + cost
+            if neighbor in final:
+                if candidate < final[neighbor]:
+                    raise ValueError(
+                        'Contradictory paths found:', 'negative weights?')
+            elif neighbor not in seen or candidate < seen[neighbor]:
+                seen[neighbor] = candidate
+                heappush(fringe, (candidate, next(counter), neighbor))
+                if predecessor is not None:
+                    predecessor[neighbor] = node
+
+    target_distances = {
+        target: final[target] for target in requested if target in final
+    }
+    if not paths:
+        return target_distances
+
+    target_paths = {}
+    for target in requested:
+        if target not in final:
+            continue
+        path = [target]
+        current = target
+        while current != source:
+            current = predecessor[current]
+            path.append(current)
+        path.reverse()
+        target_paths[target] = path
+    return target_distances, target_paths
 
 
 class BaselineRouting:
@@ -294,17 +369,24 @@ class BaselineRouting:
             try:
                 if len(primary) > 2:
                     forbidden = set(primary[1:-1])
-                    view = nx.subgraph_view(
-                        graph, filter_node=lambda node, blocked=forbidden: node not in blocked
-                    )
+
+                    def node_disjoint_weight(u, v, data, blocked=forbidden):
+                        if u in blocked or v in blocked:
+                            return None
+                        return data.get('weight', 1.0)
+
                     secondary = nx.shortest_path(
-                        view, nid, self.bs_id, weight='weight')
+                        graph, nid, self.bs_id, weight=node_disjoint_weight)
                 else:
-                    view = graph.copy()
-                    if view.has_edge(nid, self.bs_id):
-                        view.remove_edge(nid, self.bs_id)
+                    blocked_edge = (nid, self.bs_id)
+
+                    def secondary_weight(u, v, data, blocked=blocked_edge):
+                        if (u, v) == blocked:
+                            return None
+                        return data.get('weight', 1.0)
+
                     secondary = nx.shortest_path(
-                        view, nid, self.bs_id, weight='weight')
+                        graph, nid, self.bs_id, weight=secondary_weight)
                 if len(secondary) > 1 and secondary != primary:
                     tables[nid]['secondary_path'] = secondary
                     tables[nid]['secondary'] = secondary[1]
@@ -337,6 +419,13 @@ class DataPlaneHybridRouting:
         self.last_clusters: Dict[int, List[int]] = {}
         self.last_diagnostics: Dict[str, float] = {}
         self.last_graph: Optional[nx.DiGraph] = None
+
+        # Per-computation memoization. These caches are cleared whenever a new
+        # routing graph is built, so they cannot leak values across epochs.
+        self._path_vector_cache = {}
+        self._path_distance_cache = {}
+        self._path_risk_cache = {}
+        self._stress_energy_cache = {}
 
     def _cfg(self, key, default):
         return self.config.get(key, default)
@@ -533,18 +622,25 @@ class DataPlaneHybridRouting:
             return []
 
     def _path_vector(self, graph, path):
+        path_seq = list(path or [])
+        key = tuple(path_seq)
+        cached = self._path_vector_cache.get(key)
+        if cached is not None:
+            return cached
+
         vector = defaultdict(float)
-        path = list(path or [])
-        if len(path) < 2:
+        if len(path_seq) < 2:
+            self._path_vector_cache[key] = vector
             return vector
-        source = path[0]
-        first = path[1]
+        source = path_seq[0]
+        first = path_seq[1]
         vector[source] += float(graph[source][first].get('tx_energy', 0.0))
-        for idx in range(1, len(path) - 1):
-            relay = path[idx]
-            nxt = path[idx + 1]
+        for idx in range(1, len(path_seq) - 1):
+            relay = path_seq[idx]
+            nxt = path_seq[idx + 1]
             vector[relay] += float(graph[relay][nxt].get('rx_energy', 0.0))
             vector[relay] += float(graph[relay][nxt].get('tx_energy', 0.0))
+        self._path_vector_cache[key] = vector
         return vector
 
     @staticmethod
@@ -560,11 +656,15 @@ class DataPlaneHybridRouting:
 
     def _stress_stats(self, burden, nodes):
         stresses = []
+        energy_cache = self._stress_energy_cache
         for nid, value in burden.items():
             if nid == self.bs_id or nid not in nodes:
                 continue
-            energy = max(self._finite(
-                getattr(nodes[nid], 'E_current', 0.0)), 1e-12)
+            energy = energy_cache.get(nid)
+            if energy is None:
+                energy = max(self._finite(
+                    getattr(nodes[nid], 'E_current', 0.0)), 1e-12)
+                energy_cache[nid] = energy
             stresses.append(max(0.0, float(value)) / energy)
         if not stresses:
             return 0.0, 0.0
@@ -579,18 +679,32 @@ class DataPlaneHybridRouting:
     def _path_hops(path):
         return max(0, len(list(path or [])) - 1)
 
-    @staticmethod
-    def _path_distance(graph, path):
+    def _path_distance(self, graph, path):
+        path_seq = list(path or [])
+        key = tuple(path_seq)
+        cached = self._path_distance_cache.get(key)
+        if cached is not None:
+            return cached
         total = 0.0
-        for u, v in zip(list(path or [])[:-1], list(path or [])[1:]):
+        for u, v in zip(path_seq[:-1], path_seq[1:]):
             if not graph.has_edge(u, v):
+                self._path_distance_cache[key] = math.inf
                 return math.inf
             total += float(graph[u][v].get('distance', 0.0))
+        self._path_distance_cache[key] = total
         return total
 
-    @staticmethod
-    def _path_risk(graph, path):
-        return max((float(graph[u][v].get('security_stress', 0.0)) for u, v in zip(list(path or [])[:-1], list(path or [])[1:])), default=0.0)
+    def _path_risk(self, graph, path):
+        path_seq = list(path or [])
+        key = tuple(path_seq)
+        cached = self._path_risk_cache.get(key)
+        if cached is not None:
+            return cached
+        value = max((float(graph[u][v].get('security_stress', 0.0))
+                     for u, v in zip(path_seq[:-1], path_seq[1:])),
+                    default=0.0)
+        self._path_risk_cache[key] = value
+        return value
 
     def _select_heads(self, graph, nodes, penalties, k_opt):
         if self.bs_id not in nodes:
@@ -649,11 +763,10 @@ class DataPlaneHybridRouting:
             float(self._cfg('data_member_to_ch_cost_ratio', 1.35)), 1.0)
         for source in sorted(nid for nid in graph if nid != self.bs_id and nid not in heads):
             try:
-                # One Dijkstra traversal provides the distance to the BS and
-                # every candidate head.  The previous implementation launched
-                # a separate Dijkstra call for each destination.
-                lengths = nx.single_source_dijkstra_path_length(
-                    graph, source, weight='weight')
+                # Preserve NetworkX's Dijkstra ordering, but stop as soon as
+                # the BS and every candidate head have final distances.
+                lengths = _dijkstra_targets_exact(
+                    graph, source, set(heads) | {self.bs_id}, weight='weight')
                 direct_cost = lengths[self.bs_id]
             except (nx.NetworkXNoPath, nx.NodeNotFound, KeyError):
                 continue
@@ -705,12 +818,13 @@ class DataPlaneHybridRouting:
         metric = nx.Graph()
         physical = {}
         for i, u in enumerate(terminals):
+            later_terminals = terminals[i + 1:]
             try:
-                lengths, paths = nx.single_source_dijkstra(
-                    undirected, u, weight='weight')
+                lengths, paths = _dijkstra_targets_exact(
+                    undirected, u, later_terminals, weight='weight', paths=True)
             except nx.NetworkXError:
                 continue
-            for v in terminals[i + 1:]:
+            for v in later_terminals:
                 if v in lengths:
                     metric.add_edge(u, v, weight=float(lengths[v]))
                     physical[(u, v)] = list(paths[v])
@@ -983,20 +1097,28 @@ class DataPlaneHybridRouting:
         """
         candidates = []
         blocked_nodes = frozenset(primary[1:-1])
-        view = nx.subgraph_view(
-            graph, filter_node=lambda node: node not in blocked_nodes)
+
+        def node_disjoint_weight(u, v, data):
+            if u in blocked_nodes or v in blocked_nodes:
+                return None
+            return data.get('weight', 1.0)
+
         try:
             candidates.append(nx.shortest_path(
-                view, source, self.bs_id, weight='weight'))
+                graph, source, self.bs_id, weight=node_disjoint_weight))
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             pass
 
         blocked_edges = frozenset(zip(primary[:-1], primary[1:]))
-        view = nx.subgraph_view(
-            graph, filter_edge=lambda u, v: (u, v) not in blocked_edges)
+
+        def edge_disjoint_weight(u, v, data):
+            if (u, v) in blocked_edges:
+                return None
+            return data.get('weight', 1.0)
+
         try:
             candidates.append(nx.shortest_path(
-                view, source, self.bs_id, weight='weight'))
+                graph, source, self.bs_id, weight=edge_disjoint_weight))
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             pass
 
@@ -1015,29 +1137,6 @@ class DataPlaneHybridRouting:
                 factor += edge_penalty
             return float(data.get('weight', 1.0)) * factor
 
-        # One reverse Dijkstra traversal yields the overlap-penalised shortest
-        # suffix from every node to the BS.  The previous code repeated a full
-        # shortest-path search for the source and for every alternate first
-        # hop, although all of them used the same edge-weight function.
-        overlap_paths_to_bs = {}
-        reverse_graph = graph.reverse(copy=False)
-
-        def reverse_overlap_weight(u, v, data):
-            return overlap_weight(v, u, data)
-
-        try:
-            _, reverse_paths = nx.single_source_dijkstra(
-                reverse_graph, self.bs_id, weight=reverse_overlap_weight)
-            overlap_paths_to_bs = {
-                node: list(reversed(path))
-                for node, path in reverse_paths.items()
-            }
-            source_path = overlap_paths_to_bs.get(source)
-            if source_path:
-                candidates.append(source_path)
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            overlap_paths_to_bs = {}
-
         # Explore a small number of alternate first hops.  This often finds a
         # different physical corridor when strict node-disjoint routing does
         # not exist, without exponential path enumeration.
@@ -1051,7 +1150,33 @@ class DataPlaneHybridRouting:
             edge_weight = float(graph[source][neighbor].get('weight', 1.0))
             neighbors.append((edge_weight, neighbor))
         neighbors.sort()
-        for _, neighbor in neighbors[:neighbor_budget]:
+        selected_neighbors = neighbors[:neighbor_budget]
+
+        # The original full reverse traversal is equivalent for the requested
+        # source/neighbor suffixes. Stop after those paths are settled.
+        overlap_paths_to_bs = {}
+        reverse_graph = graph.reverse(copy=False)
+
+        def reverse_overlap_weight(u, v, data):
+            return overlap_weight(v, u, data)
+
+        try:
+            targets = {source}
+            targets.update(neighbor for _, neighbor in selected_neighbors)
+            _, reverse_paths = _dijkstra_targets_exact(
+                reverse_graph, self.bs_id, targets,
+                weight=reverse_overlap_weight, paths=True)
+            overlap_paths_to_bs = {
+                node: list(reversed(path))
+                for node, path in reverse_paths.items()
+            }
+            source_path = overlap_paths_to_bs.get(source)
+            if source_path:
+                candidates.append(source_path)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            overlap_paths_to_bs = {}
+
+        for _, neighbor in selected_neighbors:
             suffix = overlap_paths_to_bs.get(neighbor)
             if suffix:
                 path = [source] + list(suffix)
@@ -1212,6 +1337,10 @@ class DataPlaneHybridRouting:
                 'projected_primary_energy_ratio': 1.0,
             }
             return mirrored
+        self._path_vector_cache.clear()
+        self._path_distance_cache.clear()
+        self._path_risk_cache.clear()
+        self._stress_energy_cache.clear()
         graph, k_opt = self._build_graph(active_nodes_dict, penalties)
         tables = {
             nid: self._empty_table()

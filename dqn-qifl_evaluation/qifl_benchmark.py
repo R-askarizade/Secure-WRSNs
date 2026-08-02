@@ -3,14 +3,14 @@ Performance Benchmark and Numerical Validation of Vectorized QIFL
 
 To rigorously evaluate the computational efficiency and mathematical integrity 
 of the Quantum-Inspired Fuzzy Logic (QIFL) implementation, a performance 
-benchmark was conducted over 10,000 generated samples on a standard CPU[cite: 4]. 
+benchmark was conducted over 10,000 generated samples on a standard CPU. 
 The evaluation compares batch-vectorized and scalar-vectorized executions 
 against an equivalent classical loop baseline.
 
 A) Batch Processing Acceleration:
 The vectorized batch inference demonstrated a processing time of approximately 
 0.23 seconds for 10,000 samples, achieving a computational speedup of 3.8x 
-compared to the classical loop execution (0.88 seconds)[cite: 4]. This 
+compared to the classical loop execution (0.88 seconds). This 
 substantial acceleration highlights the efficiency of expressing quantum-inspired 
 probability amplitudes via linear algebra (matrix multiplications), making it 
 highly scalable for large-scale offline training or audit workloads.
@@ -18,7 +18,7 @@ highly scalable for large-scale offline training or audit workloads.
 B) Scalar Execution and Tensor Overhead:
 For sequential (scalar) processing—which emulates isolated, real-time 
 decision-making queries in the control loop—the execution required 1.30 seconds, 
-yielding a 0.67x speed ratio relative to the classical loop[cite: 4]. This 
+yielding a 0.67x speed ratio relative to the classical loop. This 
 marginal deceleration reflects the inherent computational overhead of dispatching 
 single-element tensor operations on classical CPU hardware. However, this is an 
 acceptable and minimal trade-off for the continuous differentiability the 
@@ -28,14 +28,14 @@ C) Absolute Numerical Equivalence:
 A critical metric for validation is the mathematical fidelity of the optimized 
 architecture. The benchmark confirms that the maximum absolute output difference 
 between the vectorized QIFL (both batch and scalar) and the classical loop 
-remains strictly bounded below 6.29e-08[cite: 4]. This negligible discrepancy 
+remains strictly bounded below 6.29e-08. This negligible discrepancy 
 guarantees that the transition to a matrix-based quantum-inspired architecture 
 preserves absolute mathematical integrity without any degradation in precision.
 
 D) Scientific Scope of Optimization:
 It is explicitly noted that the observed performance gains (3.8x speedup) are 
 attributed strictly to classical vectorization and architectural optimizations 
-within the software layer, rather than physical quantum speedup capabilities[cite: 4]. 
+within the software layer, rather than physical quantum speedup capabilities. 
 This transparent benchmark validates the algorithmic efficiency of QIFL on 
 conventional hardware.
 """
