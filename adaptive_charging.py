@@ -175,7 +175,7 @@ def derive_adaptive_charging_hyperparameters(
         "adaptive_expected_mission_time_s": float(expected_mission_time),
         "adaptive_expected_travel_distance": float(expected_travel_distance),
         "adaptive_expected_radio_neighbors": float(expected_radio_neighbors),
-        # New hyperparams for Dynamic/Partial Charging
+        # Hyperparams for Dynamic/Partial Charging
         "dynamic_charging_weight_wt": 1.0,
         "dynamic_charging_weight_eps": 1.0,
         "dynamic_charging_weight_now": 1.0,

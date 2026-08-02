@@ -2088,7 +2088,6 @@ class BaseStation:
         e0 = float(st.get('E_initial', 1.0))
         q = self._effective_depletion_rate(node_id, now)
 
-        # ---------------------------------------------------------
         # [INNOVATION] CH-Aware Charging Urgency Boost
         # If the node is a Cluster Head (or intermediate backbone node),
         # its death would sever the connection for its entire cluster.
@@ -2097,7 +2096,6 @@ class BaseStation:
         is_ch = node_id in getattr(self, 'cluster_heads', {})
         if is_ch:
             q *= 1.5  # 50% urgency boost for Cluster Heads
-        # ---------------------------------------------------------
 
         ttd = e / max(q, 1e-12) if q > 0 else 1e6
         node = self.network_nodes.get(node_id)

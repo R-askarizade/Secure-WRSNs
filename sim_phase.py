@@ -69,9 +69,7 @@ def _base_config():
         'use_dqn_charger_routing': False,
         'enable_qifl_learning': True,
 
-        # ---------------------------------------------------------
         # NEW: Multi-Node RF Charging & Dynamic Partial Allocation
-        # ---------------------------------------------------------
         'use_hybrid_fixed_chargers': False,
         'use_rf_multi_node_charging': False,
         'rf_charging_radius': 25.0,
@@ -87,11 +85,8 @@ def _base_config():
         'fixed_charger_count': 1,
         'fixed_charger_trigger_ratio': 0.15,
         'fixed_charger_target_ratio': 0.88,
-        # ---------------------------------------------------------
 
-        # ---------------------------------------------------------
         # NEW: Hybrid Hierarchical Routing & Clustering Parameters
-        # ---------------------------------------------------------
         # The original routing engine remains the reference plane for
         # control and all charging decisions.  Only DATA packets use the new
         # clustered/MST overlay below.
@@ -113,7 +108,6 @@ def _base_config():
         'data_route_min_improvement': 0.0025,
         'data_secondary_k_paths': 24,
         'data_secondary_max_energy_stretch': 1.0,
-        # ---------------------------------------------------------
 
         'energy_ewma_beta': 0.70,
         'qifl_learning_rate': 5e-3,
@@ -415,7 +409,7 @@ def _scenarios_for_mode(mode):
             'experiment_family': 'routing_clustering_ablation',
             'enable_energy_experiment': True,
 
-            # Active New Routing Features
+            # Active Routing Features
             'use_hybrid_hierarchical_routing': True,
             'use_data_plane_hybrid_routing': True,
             'use_adaptive_greedy_weights': True,
@@ -1378,8 +1372,8 @@ def run_statistical_experiments():
             int(float(config.get('simulation_time_override_s', SIM_TIME)))
         )
         for seed in range(1, NUM_SEEDS + 1):
-            print(f"\n--- {scenario_name}: Seed {seed}/{NUM_SEEDS}; "
-                  f"sim_time={scenario_sim_time}s ---")
+            print(f"\n{scenario_name}: Seed {seed}/{NUM_SEEDS}; "
+                  f"sim_time={scenario_sim_time}s")
             sim = SimulatorManager(
                 num_nodes=NUM_NODES, sim_time=scenario_sim_time,
                 ablation_config=config, seed=seed)

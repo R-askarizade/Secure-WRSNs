@@ -133,9 +133,7 @@ class SensorNode:
         self.topology_alert_cooldown = 300.0
         self.last_bad_next_hop = None
 
-        # ---------------------------------------------------------
         # Hybrid Fixed Charger Properties
-        # ---------------------------------------------------------
         self.has_fixed_charger = False
         self.last_trickle_time = None
         self.cached_tx_range = 40.0
