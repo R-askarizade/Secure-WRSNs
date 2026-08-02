@@ -141,6 +141,24 @@ def load_settings(path: Path) -> dict[str, Any]:
     )
     if seed_groups[0] & seed_groups[1] or seed_groups[0] & seed_groups[2] or seed_groups[1] & seed_groups[2]:
         raise ValueError("Sensitivity, optimization, and final seed sets must be disjoint")
+
+    # Validate the Morris configuration while loading settings so malformed
+    # experiments fail before any registry, audit, or simulation work begins.
+    morris_cfg = settings["morris"]
+    candidate = int(morris_cfg["candidate_trajectories"])
+    optimal = int(morris_cfg["optimal_trajectories"])
+    levels = int(morris_cfg["num_levels"])
+    if candidate < 2:
+        raise ValueError("morris.candidate_trajectories must be at least 2")
+    if optimal < 1:
+        raise ValueError("morris.optimal_trajectories must be at least 1")
+    if optimal >= candidate:
+        raise ValueError(
+            "morris.optimal_trajectories must be strictly less than "
+            "morris.candidate_trajectories"
+        )
+    if levels < 2:
+        raise ValueError("morris.num_levels must be at least 2")
     return settings
 
 
@@ -406,16 +424,29 @@ def cmd_audit(args: argparse.Namespace, settings: Mapping[str, Any]) -> None:
 
 
 def cmd_morris_generate(args: argparse.Namespace, settings: Mapping[str, Any]) -> None:
-    dependency_guard("SALib")
-    from SALib.sample import morris
-
     specs = get_specs(args.profile)
     cfg = settings["morris"]
     candidate = int(args.candidate_trajectories or cfg["candidate_trajectories"])
     optimal = int(args.optimal_trajectories or cfg["optimal_trajectories"])
     levels = int(args.num_levels or cfg["num_levels"])
-    if optimal > candidate:
-        raise ValueError("optimal_trajectories cannot exceed candidate_trajectories")
+    # Repeat validation after resolving CLI overrides. SALib requires the
+    # number of selected optimal trajectories to be strictly smaller than
+    # the number of candidate trajectories.
+    if candidate < 2:
+        raise ValueError("candidate_trajectories must be at least 2")
+    if optimal < 1:
+        raise ValueError("optimal_trajectories must be at least 1")
+    if optimal >= candidate:
+        raise ValueError(
+            "optimal_trajectories must be strictly less than "
+            "candidate_trajectories"
+        )
+    if levels < 2:
+        raise ValueError("num_levels must be at least 2")
+
+    dependency_guard("SALib")
+    from SALib.sample import morris
+
     X = morris.sample(
         unit_problem(specs),
         N=candidate,

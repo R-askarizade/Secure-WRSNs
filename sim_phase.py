@@ -1351,7 +1351,7 @@ def run_statistical_experiments():
     if normalized_mode == 'innovation_coverage':
         return run_innovation_coverage_validation()
 
-    NUM_SEEDS = int(os.environ.get('WRSN_NUM_SEEDS', 1))
+    NUM_SEEDS = int(os.environ.get('WRSN_NUM_SEEDS', 20))
     NUM_NODES = int(os.environ.get('WRSN_NUM_NODES', 100))
     sim_time_env = os.environ.get('WRSN_SIM_TIME')
     SIM_TIME = int(sim_time_env) if sim_time_env is not None else 3600

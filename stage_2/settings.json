@@ -2,12 +2,35 @@
   "scenario_mode": "energy",
   "num_nodes": 100,
   "simulation_time_s": 3600,
-  "network_size": [100.0, 100.0],
-  "sensitivity_seeds": [101, 102, 103, 104],
-  "optimization_seeds": [201, 202, 203, 204, 205, 206],
+  "network_size": [
+    100.0,
+    100.0
+  ],
+  "sensitivity_seeds": [
+    1,
+    2,
+    3,
+    4
+  ],
+  "optimization_seeds": [
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
   "final_evaluation_seeds": [
-    1001, 1002, 1003, 1004, 1005,
-    1006, 1007, 1008, 1009, 1010
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20
   ],
   "analysis_metrics": [
     "MC_Deadline_Failure_Rate",
@@ -33,7 +56,7 @@
     "num_levels": 8,
     "bootstrap_resamples": 1000,
     "selection_mu_star_fraction": 0.05,
-    "selection_sigma_fraction": 0.10,
+    "selection_sigma_fraction": 0.1,
     "min_selected": 4,
     "max_selected": 16
   },

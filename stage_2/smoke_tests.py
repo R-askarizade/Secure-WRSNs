@@ -90,7 +90,6 @@ def test_paired_seed_completeness_guard() -> None:
     evaluations = pd.DataFrame([
         {"design_id": "morris_000000", "Seed": 101, "Status": "SUCCESS", "MCC": 0.1},
         {"design_id": "morris_000000", "Seed": 102, "Status": "SUCCESS", "MCC": 0.2},
-        {"design_id": "morris_000001", "Seed": 101, "Status": "SUCCESS", "MCC": 0.3},
     ])
     try:
         aggregate_design_results(

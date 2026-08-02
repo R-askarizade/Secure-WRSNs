@@ -49,7 +49,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from run_dqn_independent_evaluation import parse_int_list, run_one
+from dqn_independent_evaluation import parse_int_list, run_one
 
 
 def main() -> None:
@@ -69,7 +69,19 @@ def main() -> None:
     checkpoint = out / "dqn_trained_checkpoint.bin"
     previous = None
 
-    for seed in parse_int_list(args.train_seeds):
+    train_seeds = parse_int_list(args.train_seeds)
+    test_seeds = parse_int_list(args.test_seeds)
+
+    if len(train_seeds) != len(set(train_seeds)):
+        raise ValueError("Training seeds must be unique.")
+    if len(test_seeds) != len(set(test_seeds)):
+        raise ValueError("Test seeds must be unique.")
+    overlap = sorted(set(train_seeds) & set(test_seeds))
+    if overlap:
+        raise ValueError(
+            f"Training and test seeds must be disjoint; overlap={overlap}")
+
+    for seed in train_seeds:
         run_one(
             policy="dqn_safe", seed=seed, nodes=args.nodes,
             sim_time=args.time, out_dir=out / "train",
@@ -80,7 +92,7 @@ def main() -> None:
 
     # Frozen-policy evaluation. The companion script can then compare this
     # checkpoint with all baselines using recorded/replayed workloads.
-    for seed in parse_int_list(args.test_seeds):
+    for seed in test_seeds:
         workload = out / "test" / f"workload_seed{seed}.json"
         run_one(
             policy="dqn_safe", seed=seed, nodes=args.nodes,
