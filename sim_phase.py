@@ -123,6 +123,22 @@ def _base_config():
         'dqn_exploration_mode': 'uncertainty_adaptive',
         'dqn_warmup_updates': 32,
         'dqn_warmup_competitive_decisions': 24,
+        # Legacy-compatible default. The optional composite mode can use
+        # updates, replay size, TD-error stability, and a decision timeout.
+        'dqn_warmup_readiness_mode': 'competitive_only',
+        'dqn_warmup_min_replay_samples': None,
+        'dqn_warmup_td_abs_threshold': None,
+        'dqn_warmup_td_window': 20,
+        'dqn_warmup_max_total_decisions': None,
+        # Observer-only learning audit. These defaults add measurements but do
+        # not alter target selection, rewards, exploration, or safety shields.
+        'enable_dqn_audit_logging': True,
+        'dqn_training_enabled': True,
+        'dqn_checkpoint_load_path': None,
+        'dqn_checkpoint_save_path': None,
+        'dqn_checkpoint_load_optimizer': False,
+        'workload_trace_record_path': None,
+        'workload_trace_replay_path': None,
         'use_gpu_for_adaptive_charging': True,
         'adaptive_compute_device': 'auto',
         'require_pytorch_for_adaptive_charging': True,

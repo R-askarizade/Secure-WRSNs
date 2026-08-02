@@ -152,6 +152,20 @@ class MetricsCollector:
         self.dqn_single_candidate_decisions = 0
         self.dqn_effective_exploration_count = 0
         self.dqn_safety_override_count = 0
+        # Observer-only DQN audit metrics. They do not influence selection.
+        self.dqn_raw_proposal_count = 0
+        self.dqn_direct_execution_count = 0
+        self.dqn_heuristic_warmup_execution_count = 0
+        self.dqn_heuristic_safety_execution_count = 0
+        self.dqn_safety_forced_single_count = 0
+        self.dqn_training_updates = 0
+        self._dqn_last_audit_update = -1
+        self.dqn_replay_size_end = 0
+        self.dqn_replay_capacity = 0
+        self.dqn_td_abs_errors = []
+        self.dqn_state_coverage_fraction = {}
+        self.dqn_decision_mode_counts = {}
+        self.dqn_override_reason_counts = {}
         self.dqn_training_losses = []
         self.dqn_rewards = []
         self.dqn_reward_energy_components = []
@@ -208,6 +222,52 @@ class MetricsCollector:
         # DATA-only routing overlay diagnostics.  These metrics are separated
         # from all mobile-charging metrics.
         self.data_routing_diagnostics_history = []
+
+    def record_dqn_decision_audit(self, explanation):
+        if not explanation:
+            return
+        mode = str(explanation.get('selection_mode', 'unknown'))
+        self.dqn_decision_mode_counts[mode] = (
+            self.dqn_decision_mode_counts.get(mode, 0) + 1)
+        reason = explanation.get('safety_override_reason')
+        if reason:
+            reason = str(reason)
+            self.dqn_override_reason_counts[reason] = (
+                self.dqn_override_reason_counts.get(reason, 0) + 1)
+        if explanation.get('dqn_proposed_node_id') is not None:
+            self.dqn_raw_proposal_count += 1
+        if mode == 'dqn_with_safety_shield':
+            self.dqn_direct_execution_count += 1
+        elif mode == 'heuristic_competitive_warmup':
+            self.dqn_heuristic_warmup_execution_count += 1
+        elif mode == 'heuristic_safety_override':
+            self.dqn_heuristic_safety_execution_count += 1
+        elif mode == 'safety_forced_single_candidate':
+            self.dqn_safety_forced_single_count += 1
+
+    def record_dqn_training_audit(self, dqn):
+        if dqn is None:
+            return
+        snapshot = dqn.audit_snapshot() if hasattr(dqn, 'audit_snapshot') else {}
+        update_count = int(snapshot.get(
+            'training_updates', self.dqn_training_updates))
+        self.dqn_training_updates = update_count
+        self.dqn_replay_size_end = int(snapshot.get(
+            'replay_size', self.dqn_replay_size_end))
+        self.dqn_replay_capacity = int(snapshot.get(
+            'replay_capacity', self.dqn_replay_capacity))
+        self.dqn_state_coverage_fraction = dict(
+            snapshot.get('state_coverage_fraction', {}) or {})
+        td_value = snapshot.get('last_td_abs_mean')
+        if td_value is not None:
+            try:
+                td_value = float(td_value)
+            except (TypeError, ValueError):
+                td_value = None
+            if (td_value is not None and math.isfinite(td_value)
+                    and update_count > self._dqn_last_audit_update):
+                self.dqn_td_abs_errors.append(td_value)
+                self._dqn_last_audit_update = update_count
 
     def record_data_routing_diagnostics(self, diagnostics):
         if not diagnostics:
@@ -667,12 +727,59 @@ class MetricsCollector:
             self.dqn_effective_exploration_count)
         summary['DQN_Safety_Override_Count'] = int(
             self.dqn_safety_override_count)
+        summary['DQN_Raw_Proposal_Count'] = int(
+            self.dqn_raw_proposal_count)
+        summary['DQN_Direct_Execution_Count'] = int(
+            self.dqn_direct_execution_count)
+        summary['DQN_Direct_Execution_Rate'] = self._safe_rate(
+            self.dqn_direct_execution_count,
+            self.dqn_competitive_decisions, undefined=0.0)
+        summary['DQN_Heuristic_Warmup_Execution_Count'] = int(
+            self.dqn_heuristic_warmup_execution_count)
+        summary['DQN_Heuristic_Safety_Execution_Count'] = int(
+            self.dqn_heuristic_safety_execution_count)
+        summary['DQN_Safety_Forced_Single_Count'] = int(
+            self.dqn_safety_forced_single_count)
+        summary['DQN_Training_Updates'] = int(self.dqn_training_updates)
+        summary['DQN_Replay_Size_End'] = int(self.dqn_replay_size_end)
+        summary['DQN_Replay_Capacity'] = int(self.dqn_replay_capacity)
+        summary['DQN_TD_Abs_Error_Avg'] = float(np.mean(
+            self.dqn_td_abs_errors)) if self.dqn_td_abs_errors else 0.0
+        summary['DQN_TD_Abs_Error_Last'] = float(
+            self.dqn_td_abs_errors[-1]) if self.dqn_td_abs_errors else 0.0
+        coverage_values = list(self.dqn_state_coverage_fraction.values())
+        summary['DQN_State_Coverage_Avg'] = float(np.mean(
+            coverage_values)) if coverage_values else 0.0
+        summary['DQN_State_Coverage_Min'] = float(np.min(
+            coverage_values)) if coverage_values else 0.0
+        summary['DQN_Decision_Mode_Counts'] = json.dumps(
+            self.dqn_decision_mode_counts, sort_keys=True)
+        summary['DQN_Override_Reason_Counts'] = json.dumps(
+            self.dqn_override_reason_counts, sort_keys=True)
         for key, value in self.adaptive_hyperparameters.items():
             summary[f'AdaptiveHP_{key}'] = value
         summary['DQN_Training_Loss_Avg'] = float(
             np.mean(self.dqn_training_losses)) if self.dqn_training_losses else 0.0
+        if self.dqn_training_losses:
+            window = max(1, len(self.dqn_training_losses) // 4)
+            summary['DQN_Training_Loss_Early_Avg'] = float(np.mean(
+                self.dqn_training_losses[:window]))
+            summary['DQN_Training_Loss_Late_Avg'] = float(np.mean(
+                self.dqn_training_losses[-window:]))
+        else:
+            summary['DQN_Training_Loss_Early_Avg'] = 0.0
+            summary['DQN_Training_Loss_Late_Avg'] = 0.0
         summary['DQN_Reward_Avg'] = float(
             np.mean(self.dqn_rewards)) if self.dqn_rewards else 0.0
+        if self.dqn_rewards:
+            reward_window = max(1, len(self.dqn_rewards) // 4)
+            summary['DQN_Reward_Early_Avg'] = float(np.mean(
+                self.dqn_rewards[:reward_window]))
+            summary['DQN_Reward_Late_Avg'] = float(np.mean(
+                self.dqn_rewards[-reward_window:]))
+        else:
+            summary['DQN_Reward_Early_Avg'] = 0.0
+            summary['DQN_Reward_Late_Avg'] = 0.0
         summary['DQN_Reward_Energy_Component_Avg'] = float(
             np.mean(self.dqn_reward_energy_components)) if self.dqn_reward_energy_components else 0.0
         summary['DQN_Reward_Deadline_Component_Avg'] = float(

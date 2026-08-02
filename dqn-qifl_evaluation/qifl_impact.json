@@ -1,0 +1,28 @@
+{
+  "experiment_title": "Improvement Evaluation of QIFL vs Standard Fuzzy Logic",
+  "evaluations": {
+    "differentiability": {
+      "metric": "Differentiability (Gradient Descent)",
+      "initial_loss": 0.000165,
+      "final_loss": 0.000106,
+      "loss_reduction_percent": 35.37,
+      "conclusion": "QIFL allows continuous gradient flow, successfully reducing error and enabling integration with Deep Reinforcement Learning (DRL)."
+    },
+    "smoothness_and_stability": {
+      "metric": "Superposition Smoothness (Output Stability)",
+      "max_output_jump": 1.425e-05,
+      "avg_output_jump": 1.404e-05,
+      "conclusion": "Outputs change continuously without rigid step-jumps. Quantum-inspired probability amplitudes (via Softmax) prevent the plateau effects common in traditional crisp fuzzy rule boundaries."
+    },
+    "parameter_efficiency": {
+      "metric": "Parameter Efficiency",
+      "trainable_parameters_count": 45,
+      "tensor_shape": [
+        9,
+        5
+      ],
+      "conclusion": "The entire fuzzy rule base is compactly encoded into just 45 trainable parameters. This extreme efficiency significantly reduces computational overhead during DRL neural network backpropagation."
+    }
+  },
+  "overall_scientific_verdict": "The adoption of Quantum-Inspired Fuzzy Logic (QIFL) significantly upgrades traditional fuzzy logic. 1. By replacing discrete Min/Max operations with continuous matrix multiplications, it achieves full differentiability. 2. By mapping rule activations to quantum probability amplitudes (Softmax), it guarantees smooth transition states without rigid plateaus. 3. By structuring the rule base as a compact logit tensor, it highly optimizes parameter usage for real-time WSN routing and charging optimization."
+}

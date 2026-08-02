@@ -151,6 +151,14 @@ class SimulatorManager:
             'Control_Epoch_Duration_s': 10.0,
             'Simulation_Time_Model': 'continuous_event_driven_with_fixed_control_epochs',
             'Adaptive_Training_Mode': 'online_warmup_and_safety_shielded',
+            'DQN_Audit_Observer_Only_Flag': bool(
+                self.ablation.get('enable_dqn_audit_logging', True)),
+            'DQN_Training_Enabled_Flag': bool(
+                self.ablation.get('dqn_training_enabled', True)),
+            'Charger_Target_Policy': str(self.ablation.get(
+                'charger_target_policy', 'dqn_safe')),
+            'Workload_Replay_Enabled_Flag': bool(
+                self.ablation.get('workload_trace_replay_path')),
             'Charging_Audit_Enforcement_Mode': str(self.ablation.get('charging_audit_enforcement_mode', 'shadow')),
             'Legacy_MC_Claim_Credit_Preserved_Flag': bool(self.ablation.get('preserve_legacy_mc_claim_credit', True)),
             'Attack_Model_Mode': str(self.ablation.get('attack_model_mode', 'legacy_compatible')),
@@ -235,6 +243,21 @@ class SimulatorManager:
 
         self.use_dqn_charger_routing = bool(
             self.ablation.get('use_dqn_charger_routing', False))
+        default_policy = (
+            'dqn_safe' if self.use_dqn_charger_routing else 'heuristic_only')
+        self.charger_target_policy = str(self.ablation.get(
+            'charger_target_policy', default_policy)).strip().lower()
+        self.dqn_training_enabled = bool(
+            self.ablation.get('dqn_training_enabled', True))
+        self.enable_dqn_audit_logging = bool(
+            self.ablation.get('enable_dqn_audit_logging', True))
+        self.policy_rng = random.Random(int(self.seed) + 500_009)
+        self.workload_trace_record_path = self.ablation.get(
+            'workload_trace_record_path')
+        self.workload_trace_replay_path = self.ablation.get(
+            'workload_trace_replay_path')
+        self.metrics.experiment_parameters['Charger_Target_Policy'] = (
+            self.charger_target_policy)
         adaptive_device = self.adaptive_device_request
         self.charger_dqn = ChargerRoutingDQN(
             lr=self.ablation.get('dqn_learning_rate', 1.0e-3),
@@ -245,6 +268,16 @@ class SimulatorManager:
             warmup_updates=int(self.ablation.get('dqn_warmup_updates', 50)),
             warmup_competitive_decisions=int(self.ablation.get(
                 'dqn_warmup_competitive_decisions', 50)),
+            warmup_readiness_mode=str(self.ablation.get(
+                'dqn_warmup_readiness_mode', 'competitive_only')),
+            warmup_min_replay_samples=self.ablation.get(
+                'dqn_warmup_min_replay_samples', None),
+            warmup_td_abs_threshold=self.ablation.get(
+                'dqn_warmup_td_abs_threshold', None),
+            warmup_td_window=int(self.ablation.get(
+                'dqn_warmup_td_window', 20)),
+            warmup_max_total_decisions=self.ablation.get(
+                'dqn_warmup_max_total_decisions', None),
             critical_energy_ratio=float(self.ablation.get(
                 'critical_energy_ratio', 0.15)),
             deadline_safety_margin=float(self.ablation.get(
@@ -262,6 +295,12 @@ class SimulatorManager:
             expected_mission_time=float(self.ablation.get(
                 'adaptive_expected_mission_time_s', 90.0)),
             safe_horizon=float(self.ablation.get('qifl_safe_horizon_s', 3600.0)))
+        checkpoint_load_path = self.ablation.get('dqn_checkpoint_load_path')
+        if checkpoint_load_path:
+            self.charger_dqn.load_checkpoint(
+                checkpoint_load_path,
+                load_optimizer=bool(self.ablation.get(
+                    'dqn_checkpoint_load_optimizer', False)))
 
         adaptive_qifl_active = bool(
             self.ablation.get('use_adaptive_quantum_charging', False))
@@ -1278,6 +1317,48 @@ class SimulatorManager:
             return 0.0
         return float(return_time)
 
+    def _safe_policy_candidates(self, charger, candidate_nodes):
+        """Apply the same hard-rescue subset used by the DQN safety shield."""
+        if len(candidate_nodes) <= 1:
+            return list(candidate_nodes)
+        physical = [ChargerRoutingDQN._candidate_energy_and_deadline(
+            charger.x, charger.y, candidate, self.bs.node_states,
+            charger.speed) for candidate in candidate_nodes]
+        allowed = []
+        for candidate, values in zip(candidate_nodes, physical):
+            critical_ratio = max(
+                float(self.charger_dqn.critical_energy_ratio),
+                float(values.get('critical_energy_ratio', 0.0)))
+            if (float(values['energy_ratio']) <= critical_ratio or
+                    float(values['deadline_slack']) <=
+                    float(self.charger_dqn.deadline_safety_margin)):
+                allowed.append(candidate)
+        return allowed if allowed else list(candidate_nodes)
+
+    def _select_baseline_policy_target(self, policy, charger, candidate_nodes):
+        policy = str(policy).strip().lower()
+        if policy in {'random', 'random_safe'}:
+            safe = self._safe_policy_candidates(charger, candidate_nodes)
+            return self.policy_rng.choice(safe) if safe else None
+        if policy in {'nearest', 'nearest_first'}:
+            safe = self._safe_policy_candidates(charger, candidate_nodes)
+            return min(safe, key=lambda node: charger.distance_to_target(node))
+        if policy in {'lowest_energy', 'lowest_energy_first'}:
+            safe = self._safe_policy_candidates(charger, candidate_nodes)
+            def energy_ratio(candidate):
+                attrs = ChargerRoutingDQN._extract_physical_attributes(
+                    candidate, self.bs.node_states)
+                return float(attrs['estimated_energy']) / max(
+                    float(attrs['initial_energy']), 1e-12)
+            return min(safe, key=energy_ratio)
+        if policy in {'earliest_deadline', 'earliest_deadline_first'}:
+            safe = self._safe_policy_candidates(charger, candidate_nodes)
+            return min(safe, key=lambda candidate:
+                       ChargerRoutingDQN._candidate_energy_and_deadline(
+                           charger.x, charger.y, candidate,
+                           self.bs.node_states, charger.speed)['deadline_slack'])
+        return None
+
     def _select_target_for_charger(self, charger, candidate_ids, assigned_nodes=None):
         assigned_nodes = set() if assigned_nodes is None else set(assigned_nodes)
         candidate_nodes = []
@@ -1299,7 +1380,9 @@ class SimulatorManager:
         elif self._relative_mc_feasibility_guard_enabled():
             return None
 
-        if self.use_dqn_charger_routing:
+        policy = self.charger_target_policy
+        if self.use_dqn_charger_routing and policy in {
+                'dqn', 'dqn_safe', 'dqn_with_safety_shield'}:
             network_diag = math.hypot(*self.network_size)
             selected = self.charger_dqn.select(
                 charger.x, charger.y, candidate_nodes, self.bs.node_states,
@@ -1315,8 +1398,17 @@ class SimulatorManager:
                 self.metrics.dqn_effective_exploration_count += 1
             if explanation.get('safety_override'):
                 self.metrics.dqn_safety_override_count += 1
+            if self.enable_dqn_audit_logging:
+                self.metrics.record_dqn_decision_audit(explanation)
             return selected
 
+        baseline_selected = self._select_baseline_policy_target(
+            policy, charger, candidate_nodes)
+        if baseline_selected is not None:
+            return baseline_selected
+
+        # Original heuristic-only behavior. This is intentionally retained as
+        # the fallback and as the explicit heuristic_only policy.
         def score(node):
             member_ids = [n.node_id for n in self._target_nodes(node)]
             priorities = [self.bs.charging_dispatch_priority(
@@ -1843,9 +1935,12 @@ class SimulatorManager:
         next_features = [self.charger_dqn.feature_for(
             charger.x, charger.y, candidate, self.bs.node_states,
             mission['network_diag']) for candidate in next_candidates]
-        loss = self.charger_dqn.train_on_transition(
-            mission['feature_before'], reward, next_features)
-        self.metrics.dqn_training_losses.append(float(loss))
+        if self.dqn_training_enabled:
+            loss = self.charger_dqn.train_on_transition(
+                mission['feature_before'], reward, next_features)
+            self.metrics.dqn_training_losses.append(float(loss))
+            if self.enable_dqn_audit_logging:
+                self.metrics.record_dqn_training_audit(self.charger_dqn)
 
     def _complete_async_mission(self, mission, completed=True):
         charger = mission['charger']
@@ -2094,9 +2189,12 @@ class SimulatorManager:
             next_features = [self.charger_dqn.feature_for(
                 charger.x, charger.y, candidate, self.bs.node_states, network_diag)
                 for candidate in next_candidates]
-            loss = self.charger_dqn.train_on_transition(
-                feature_before, reward, next_features)
-            self.metrics.dqn_training_losses.append(float(loss))
+            if self.dqn_training_enabled:
+                loss = self.charger_dqn.train_on_transition(
+                    feature_before, reward, next_features)
+                self.metrics.dqn_training_losses.append(float(loss))
+                if self.enable_dqn_audit_logging:
+                    self.metrics.record_dqn_training_audit(self.charger_dqn)
 
         if charger.E_current < float(self.ablation.get(
                 'mc_return_threshold_ratio', 0.10)) * charger.E_capacity:
@@ -2444,7 +2542,17 @@ class SimulatorManager:
         packet_seq_num = 0
         event_rate = max(float(self.ablation.get(
             'event_rate_lambda', 0.5)), 1e-12)
-        next_event_time = self.event_rng.expovariate(event_rate)
+        workload_events = None
+        workload_index = 0
+        recorded_workload = []
+        if self.workload_trace_replay_path:
+            with open(self.workload_trace_replay_path, 'r', encoding='utf-8') as handle:
+                workload_events = list(json.load(handle))
+            next_event_time = (
+                float(workload_events[0]['time']) if workload_events
+                else float('inf'))
+        else:
+            next_event_time = self.event_rng.expovariate(event_rate)
         next_epoch_time = float(self.bs.T_epoch)
         next_energy_record_time = 10.0
         self.current_time = 0.0
@@ -2522,15 +2630,38 @@ class SimulatorManager:
                 processed_network_event = True
                 if self.active_charger_missions:
                     self.metrics.mc_network_events_while_busy += 1
-                alive_nodes = [
-                    node_id for node_id, node in self.nodes.items()
-                    if node.status == 'ALIVE' and node_id != self.BS_ID]
-                if alive_nodes:
-                    active_node_id = self.event_rng.choice(alive_nodes)
-                    active_node = self.nodes[active_node_id]
-                    is_critical_event = self.event_rng.random() < float(
-                        self.ablation.get('critical_event_probability', 0.10))
-                    raw_data = 80.0 if is_critical_event else 25.0
+
+                if workload_events is not None:
+                    event = workload_events[workload_index]
+                    active_node_id = int(event['source_id'])
+                    raw_data = float(event['raw_data'])
+                    workload_index += 1
+                    next_event_time = (
+                        float(workload_events[workload_index]['time'])
+                        if workload_index < len(workload_events)
+                        else float('inf'))
+                    active_node = self.nodes.get(active_node_id)
+                    source_is_alive = (
+                        active_node is not None and active_node.status == 'ALIVE')
+                else:
+                    alive_nodes = [
+                        node_id for node_id, node in self.nodes.items()
+                        if node.status == 'ALIVE' and node_id != self.BS_ID]
+                    source_is_alive = bool(alive_nodes)
+                    if source_is_alive:
+                        active_node_id = self.event_rng.choice(alive_nodes)
+                        active_node = self.nodes[active_node_id]
+                        is_critical_event = self.event_rng.random() < float(
+                            self.ablation.get('critical_event_probability', 0.10))
+                        raw_data = 80.0 if is_critical_event else 25.0
+                        recorded_workload.append({
+                            'time': float(self.current_time),
+                            'source_id': int(active_node_id),
+                            'raw_data': float(raw_data),
+                        })
+                    next_event_time += self.event_rng.expovariate(event_rate)
+
+                if source_is_alive:
                     packet_seq_num += 1
                     method_is_critical = raw_data > active_node.adaptive_threshold
                     source_packet = active_node.sense_environment(
@@ -2539,7 +2670,6 @@ class SimulatorManager:
                         active_node_id, packet_seq_num,
                         method_is_critical, raw_data,
                         source_packet=source_packet)
-                next_event_time += self.event_rng.expovariate(event_rate)
 
             if next_epoch_time <= self.current_time + 1e-9:
                 processed_network_event = True
@@ -2592,6 +2722,17 @@ class SimulatorManager:
             'MC_Trust_Average_End': float(np.mean(mc_trust_values)) if mc_trust_values else 1.0,
             'MC_Trust_Minimum_End': float(np.min(mc_trust_values)) if mc_trust_values else 1.0,
         })
+        if self.enable_dqn_audit_logging:
+            self.metrics.record_dqn_training_audit(self.charger_dqn)
+        if self.workload_trace_record_path and workload_events is None:
+            trace_path = os.path.abspath(os.fspath(
+                self.workload_trace_record_path))
+            os.makedirs(os.path.dirname(trace_path) or '.', exist_ok=True)
+            with open(trace_path, 'w', encoding='utf-8') as handle:
+                json.dump(recorded_workload, handle, indent=2)
+        checkpoint_save_path = self.ablation.get('dqn_checkpoint_save_path')
+        if checkpoint_save_path and self.use_dqn_charger_routing:
+            self.charger_dqn.save_checkpoint(checkpoint_save_path)
 
     def _critical_failover_energy_feasible(self, route):
         """Return whether failover preserves per-node energy reserves."""

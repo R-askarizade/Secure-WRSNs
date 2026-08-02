@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 from collections import deque
 from typing import Optional, Sequence, Tuple
@@ -292,6 +293,46 @@ class QuantumFuzzyChargingOracle:
             max(float(np.sum(probabilities)), 1e-12)
         return float(np.sum(probabilities * self.centers)), probabilities
 
+    def infer_batch(self, inputs: Sequence[Tuple[float, float]]) -> Tuple[np.ndarray, np.ndarray]:
+        """Vectorized classical batch inference for offline/audit workloads.
+
+        This method does not replace the scalar control-loop inference, so the
+        published decision sequence remains unchanged. It exists to measure
+        the computational benefit of vectorized fuzzy-rule evaluation without
+        describing the implementation as quantum hardware execution.
+        """
+        pairs = list(inputs)
+        if not pairs:
+            return (np.empty(0, dtype=float),
+                    np.empty((0, len(self.centers)), dtype=float))
+        psi = np.vstack([
+            self._input_state_np(float(ed), float(sd))
+            for ed, sd in pairs
+        ])
+        if self.enabled_torch:
+            with torch.inference_mode():
+                psi_t = torch.tensor(
+                    psi, dtype=torch.float32, device=self.device)
+                rule_probabilities = torch.softmax(self.theta, dim=1)
+                probabilities = torch.matmul(psi_t, rule_probabilities)
+                probabilities = probabilities / torch.clamp(
+                    probabilities.sum(dim=1, keepdim=True), min=1e-12)
+                thresholds = torch.matmul(probabilities, self.centers_t)
+                return (
+                    thresholds.detach().cpu().numpy().astype(float),
+                    probabilities.detach().cpu().numpy().astype(float),
+                )
+
+        logits = self.theta_np - np.max(self.theta_np, axis=1, keepdims=True)
+        rule_probabilities = np.exp(np.clip(logits, -60.0, 0.0))
+        rule_probabilities /= np.maximum(
+            rule_probabilities.sum(axis=1, keepdims=True), 1e-12)
+        probabilities = psi @ rule_probabilities
+        probabilities /= np.maximum(
+            probabilities.sum(axis=1, keepdims=True), 1e-12)
+        thresholds = probabilities @ self.centers
+        return thresholds.astype(float), probabilities.astype(float)
+
     def train_step(self, ed_norm: float, sd_norm: float, target_threshold: float) -> float:
         target_threshold = float(target_threshold)
         if not self.enabled_torch:
@@ -442,6 +483,11 @@ class ChargerRoutingDQN:
         *,
         warmup_updates: int = 50,
         warmup_competitive_decisions: Optional[int] = None,
+        warmup_readiness_mode: str = "competitive_only",
+        warmup_min_replay_samples: Optional[int] = None,
+        warmup_td_abs_threshold: Optional[float] = None,
+        warmup_td_window: int = 20,
+        warmup_max_total_decisions: Optional[int] = None,
         critical_energy_ratio: float = 0.15,
         deadline_safety_margin: float = 2.0,
         heuristic_override_margin: Optional[float] = 0.75,
@@ -474,6 +520,18 @@ class ChargerRoutingDQN:
             warmup_competitive_decisions = self.warmup_updates
         self.warmup_competitive_decisions = max(
             0, int(warmup_competitive_decisions))
+        self.warmup_readiness_mode = str(
+            warmup_readiness_mode or "competitive_only").strip().lower()
+        self.warmup_min_replay_samples = (
+            None if warmup_min_replay_samples is None
+            else max(1, int(warmup_min_replay_samples)))
+        self.warmup_td_abs_threshold = (
+            None if _is_adaptive_value(warmup_td_abs_threshold)
+            else max(0.0, float(warmup_td_abs_threshold)))
+        self.warmup_td_window = max(1, int(warmup_td_window))
+        self.warmup_max_total_decisions = (
+            None if warmup_max_total_decisions is None
+            else max(1, int(warmup_max_total_decisions)))
         self.competitive_decisions = 0
         self.critical_energy_ratio = float(critical_energy_ratio)
         self.deadline_safety_margin = max(0.0, float(deadline_safety_margin))
@@ -482,15 +540,35 @@ class ChargerRoutingDQN:
 
         self.hidden_dim = max(2, int(hidden_dim))
         self.batch_size = max(1, int(batch_size))
+        if self.warmup_min_replay_samples is None:
+            self.warmup_min_replay_samples = self.batch_size
         self.target_sync_interval = max(1, int(target_sync_interval))
         self.decisions = 0
         self.last_loss = 0.0
+        self.last_td_abs_mean = 0.0
         self._updates = 0
         self.replay = deque(maxlen=max(self.batch_size, int(replay_capacity)))
 
+        # Observer-only audit state. These counters never participate in
+        # selection, reward calculation, exploration, or training updates.
         self.last_decision_explanation = None
         self.explanation_history = deque(
             maxlen=max(1, int(explanation_history_size)))
+        self.training_history = deque(
+            maxlen=max(1000, int(explanation_history_size)))
+        self.decision_mode_counts = {}
+        self.safety_override_reason_counts = {}
+        self.dqn_raw_proposal_count = 0
+        self.dqn_direct_execution_count = 0
+        self.heuristic_warmup_execution_count = 0
+        self.heuristic_safety_execution_count = 0
+        self.safety_forced_single_count = 0
+        self.state_coverage_bins = {
+            "energy_ratio": set(),
+            "distance": set(),
+            "deadline_urgency": set(),
+            "depletion_pressure": set(),
+        }
 
         self.device = _resolve_torch_device(device)
         self.enabled_torch = self.device is not None
@@ -519,6 +597,127 @@ class ChargerRoutingDQN:
             self.weights = np.zeros(7, dtype=np.float32)
             self.bias = 0.0
             self.lr = float(1e-3 if _is_adaptive_value(lr) else lr)
+
+    @staticmethod
+    def _coverage_bin(value: float, bins: int = 10) -> int:
+        value = float(np.clip(value, 0.0, 1.0))
+        return min(max(int(value * bins), 0), bins - 1)
+
+    def _commit_decision(self, explanation: dict, selected_candidate):
+        """Store audit evidence without changing the selected action."""
+        self.last_decision_explanation = explanation
+        self.explanation_history.append(explanation)
+        mode = str(explanation.get("selection_mode", "unknown"))
+        self.decision_mode_counts[mode] = self.decision_mode_counts.get(mode, 0) + 1
+        reason = explanation.get("safety_override_reason")
+        if reason:
+            reason = str(reason)
+            self.safety_override_reason_counts[reason] = (
+                self.safety_override_reason_counts.get(reason, 0) + 1)
+        if explanation.get("dqn_proposed_node_id") is not None:
+            self.dqn_raw_proposal_count += 1
+        if mode == "dqn_with_safety_shield":
+            self.dqn_direct_execution_count += 1
+        elif mode == "heuristic_competitive_warmup":
+            self.heuristic_warmup_execution_count += 1
+        elif mode == "heuristic_safety_override":
+            self.heuristic_safety_execution_count += 1
+        elif mode == "safety_forced_single_candidate":
+            self.safety_forced_single_count += 1
+
+        for candidate in explanation.get("candidates", []) or []:
+            features = candidate.get("normalized_features", {}) or {}
+            for name in self.state_coverage_bins:
+                value = features.get(name)
+                if value is not None:
+                    self.state_coverage_bins[name].add(self._coverage_bin(value))
+        return selected_candidate
+
+    def _append_training_audit(self, reward: float, loss: float, td_abs_mean: float) -> None:
+        self.last_td_abs_mean = float(max(0.0, td_abs_mean))
+        self.training_history.append({
+            "update": int(self._updates),
+            "replay_size": int(len(self.replay)),
+            "reward": float(reward),
+            "loss": float(loss),
+            "td_abs_mean": float(self.last_td_abs_mean),
+        })
+
+    def audit_snapshot(self) -> dict:
+        """Return a JSON-serializable observer-only learning audit."""
+        competitive = max(0, int(self.competitive_decisions))
+        return {
+            "decisions": int(self.decisions),
+            "competitive_decisions": competitive,
+            "warmup_readiness_mode": self.warmup_readiness_mode,
+            "warmup_active": bool(self._warmup_active()),
+            "warmup_updates_required": int(self.warmup_updates),
+            "warmup_min_replay_samples": int(self.warmup_min_replay_samples),
+            "warmup_td_abs_threshold": self.warmup_td_abs_threshold,
+            "warmup_max_total_decisions": self.warmup_max_total_decisions,
+            "training_updates": int(self._updates),
+            "replay_size": int(len(self.replay)),
+            "replay_capacity": int(self.replay.maxlen),
+            "last_loss": float(self.last_loss),
+            "last_td_abs_mean": float(self.last_td_abs_mean),
+            "dqn_raw_proposal_count": int(self.dqn_raw_proposal_count),
+            "dqn_direct_execution_count": int(self.dqn_direct_execution_count),
+            "heuristic_warmup_execution_count": int(self.heuristic_warmup_execution_count),
+            "heuristic_safety_execution_count": int(self.heuristic_safety_execution_count),
+            "safety_forced_single_count": int(self.safety_forced_single_count),
+            "direct_execution_rate": (
+                float(self.dqn_direct_execution_count) / competitive
+                if competitive > 0 else 0.0),
+            "decision_mode_counts": dict(self.decision_mode_counts),
+            "safety_override_reason_counts": dict(self.safety_override_reason_counts),
+            "state_coverage_fraction": {
+                name: len(values) / 10.0
+                for name, values in self.state_coverage_bins.items()
+            },
+        }
+
+    def save_checkpoint(self, path: str) -> str:
+        """Save a DQN checkpoint for evaluation on unseen seeds/topologies."""
+        path = os.path.abspath(os.fspath(path))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if self.enabled_torch:
+            torch.save({
+                "backend": "torch",
+                "net": self.net.state_dict(),
+                "target": self.target.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "updates": int(self._updates),
+                "competitive_decisions": int(self.competitive_decisions),
+            }, path)
+        else:
+            with open(path, "wb") as handle:
+                np.savez(handle, backend="numpy", weights=self.weights,
+                         bias=np.asarray([self.bias], dtype=float),
+                         updates=np.asarray([self._updates], dtype=int),
+                         competitive_decisions=np.asarray(
+                             [self.competitive_decisions], dtype=int))
+        return path
+
+    def load_checkpoint(self, path: str, *, load_optimizer: bool = False) -> None:
+        """Load a checkpoint without enabling training automatically."""
+        path = os.path.abspath(os.fspath(path))
+        if self.enabled_torch:
+            payload = torch.load(path, map_location=self.device)
+            self.net.load_state_dict(payload["net"])
+            self.target.load_state_dict(payload.get("target", payload["net"]))
+            if load_optimizer and payload.get("optimizer") is not None:
+                self.optimizer.load_state_dict(payload["optimizer"])
+            self._updates = int(payload.get("updates", 0))
+            self.competitive_decisions = int(
+                payload.get("competitive_decisions", 0))
+        else:
+            with np.load(path, allow_pickle=False) as payload:
+                self.weights = np.asarray(payload["weights"], dtype=np.float32)
+                self.bias = float(np.asarray(payload["bias"]).reshape(-1)[0])
+                self._updates = int(np.asarray(
+                    payload.get("updates", [0])).reshape(-1)[0])
+                self.competitive_decisions = int(np.asarray(
+                    payload.get("competitive_decisions", [0])).reshape(-1)[0])
 
     @staticmethod
     def _extract_physical_attributes(candidate, state_lookup: dict) -> dict:
@@ -718,6 +917,28 @@ class ChargerRoutingDQN:
         exposure = math.sqrt(k / max(k + self.competitive_decisions, 1))
         return float(np.clip(entropy * exposure, 0.0, 1.0))
 
+    def _warmup_active(self) -> bool:
+        """Evaluate warm-up without changing the legacy default policy."""
+        if self.warmup_readiness_mode in {
+                "competitive_only", "legacy", "legacy_competitive"}:
+            return self.competitive_decisions <= self.warmup_competitive_decisions
+
+        enough_updates = self._updates >= self.warmup_updates
+        enough_replay = len(self.replay) >= self.warmup_min_replay_samples
+        recent = list(self.training_history)[-self.warmup_td_window:]
+        if self.warmup_td_abs_threshold is None:
+            td_stable = True
+        else:
+            td_stable = (
+                len(recent) >= self.warmup_td_window and
+                float(np.mean([item["td_abs_mean"] for item in recent]))
+                <= self.warmup_td_abs_threshold)
+        readiness = enough_updates and enough_replay and td_stable
+        timeout = (
+            self.warmup_max_total_decisions is not None and
+            self.decisions >= self.warmup_max_total_decisions)
+        return not (readiness or timeout)
+
     def _deadline_feasibility_override(self, dqn_index: int, heuristic_index: int, physical_values: Sequence[dict]) -> bool:
         if dqn_index == heuristic_index:
             return False
@@ -741,7 +962,7 @@ class ChargerRoutingDQN:
         candidate_list = list(candidates)
 
         if not candidate_list:
-            self.last_decision_explanation = {
+            explanation = {
                 "decision_number": int(self.decisions),
                 "decision_time": (None if decision_time is None else float(decision_time)),
                 "charger_id": charger_id,
@@ -752,7 +973,7 @@ class ChargerRoutingDQN:
                 "competitive_decisions": int(self.competitive_decisions),
                 "candidates": [],
             }
-            return None
+            return self._commit_decision(explanation, None)
 
         self.decisions += 1
         candidate_count = len(candidate_list)
@@ -793,6 +1014,9 @@ class ChargerRoutingDQN:
                 "competitive_decisions": int(self.competitive_decisions),
                 "warmup_updates": int(self.warmup_updates),
                 "warmup_competitive_decisions": int(self.warmup_competitive_decisions),
+                "warmup_readiness_mode": self.warmup_readiness_mode,
+                "warmup_active": bool(self._warmup_active()),
+                "warmup_min_replay_samples": int(self.warmup_min_replay_samples),
                 "critical_energy_ratio": float(self.critical_energy_ratio),
                 "deadline_safety_margin": float(self.deadline_safety_margin),
                 "heuristic_override_margin": (None if self.heuristic_override_margin is None else float(self.heuristic_override_margin)),
@@ -821,9 +1045,8 @@ class ChargerRoutingDQN:
                     },
                 }],
             }
-            self.last_decision_explanation = decision_explanation
-            self.explanation_history.append(decision_explanation)
-            return selected_candidate
+            return self._commit_decision(
+                decision_explanation, selected_candidate)
 
         physical_values = [self._candidate_energy_and_deadline(
             mc_x, mc_y, c, state_lookup, speed) for c in candidate_list]
@@ -908,14 +1131,16 @@ class ChargerRoutingDQN:
                 "competitive_decisions": int(self.competitive_decisions),
                 "warmup_updates": int(self.warmup_updates),
                 "warmup_competitive_decisions": int(self.warmup_competitive_decisions),
+                "warmup_readiness_mode": self.warmup_readiness_mode,
+                "warmup_active": bool(self._warmup_active()),
+                "warmup_min_replay_samples": int(self.warmup_min_replay_samples),
                 "critical_energy_ratio": float(self.critical_energy_ratio),
                 "deadline_safety_margin": float(self.deadline_safety_margin),
                 "heuristic_override_margin": (None if self.heuristic_override_margin is None else float(self.heuristic_override_margin)),
                 "candidates": candidate_explanations,
             }
-            self.last_decision_explanation = decision_explanation
-            self.explanation_history.append(decision_explanation)
-            return selected_candidate
+            return self._commit_decision(
+                decision_explanation, selected_candidate)
 
         self.competitive_decisions += 1
         features = [self.feature_for(
@@ -932,8 +1157,7 @@ class ChargerRoutingDQN:
 
         safety_override = False
         safety_override_reason = None
-        in_competitive_warmup = (
-            self.competitive_decisions <= self.warmup_competitive_decisions)
+        in_competitive_warmup = self._warmup_active()
 
         self.epsilon = self._adaptive_exploration_probability(
             q_values, allowed_indices)
@@ -1044,14 +1268,16 @@ class ChargerRoutingDQN:
             "competitive_decisions": int(self.competitive_decisions),
             "warmup_updates": int(self.warmup_updates),
             "warmup_competitive_decisions": int(self.warmup_competitive_decisions),
+            "warmup_readiness_mode": self.warmup_readiness_mode,
+            "warmup_active": bool(self._warmup_active()),
+            "warmup_min_replay_samples": int(self.warmup_min_replay_samples),
             "critical_energy_ratio": float(self.critical_energy_ratio),
             "deadline_safety_margin": float(self.deadline_safety_margin),
             "heuristic_override_margin": (None if self.heuristic_override_margin is None else float(self.heuristic_override_margin)),
             "candidates": candidate_explanations,
         }
-        self.last_decision_explanation = decision_explanation
-        self.explanation_history.append(decision_explanation)
-        return selected_candidate
+        return self._commit_decision(
+            decision_explanation, selected_candidate)
 
     def train_on_transition(
         self,
@@ -1079,6 +1305,9 @@ class ChargerRoutingDQN:
             self._updates += 1
 
             self.last_loss = float(error * error)
+            self._append_training_audit(
+                reward=float(reward), loss=self.last_loss,
+                td_abs_mean=abs(float(error)))
             return self.last_loss
 
         batch = self._rng.sample(list(self.replay), k=min(
@@ -1102,6 +1331,8 @@ class ChargerRoutingDQN:
             target_values, dtype=torch.float32, device=self.device)
 
         predictions = self.net(feature_tensor)
+        td_abs_mean = float(torch.mean(torch.abs(
+            predictions.detach() - target_tensor)).cpu().item())
         loss = torch.nn.functional.smooth_l1_loss(predictions, target_tensor)
 
         self.optimizer.zero_grad(set_to_none=True)
@@ -1115,4 +1346,7 @@ class ChargerRoutingDQN:
             self.target.load_state_dict(self.net.state_dict())
 
         self.last_loss = float(loss.detach().cpu().item())
+        self._append_training_audit(
+            reward=float(reward), loss=self.last_loss,
+            td_abs_mean=td_abs_mean)
         return self.last_loss
