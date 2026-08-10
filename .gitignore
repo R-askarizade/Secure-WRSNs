@@ -8,3 +8,4 @@ __pycache__/
 *.py[cod]
 stage2_results/*
 results_dqn_test/*
+thesis_results/*

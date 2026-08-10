@@ -506,13 +506,13 @@ class DataPlaneHybridRouting:
             urgency = np.asarray(
                 [0.5, 1.0 - avg, penalized / max(len(valid), 1)], dtype=float)
             tau = max(
-                float(self._cfg('data_routing_weight_temperature', 0.75)), 1e-3)
+                float(self._cfg('data_routing_weight_temperature', 1.5599965406582)), 1e-3)
             logits = urgency / tau
             logits -= logits.max()
             soft = np.exp(np.clip(logits, -60.0, 0.0))
             soft /= max(float(soft.sum()), 1e-12)
             floor = float(
-                np.clip(self._cfg('data_routing_weight_floor', 0.10), 0.0, 0.25))
+                np.clip(self._cfg('data_routing_weight_floor', 0.0259280212224), 0.0, 0.25))
             soft = floor + (1.0 - 3.0 * floor) * soft
             soft /= max(float(soft.sum()), 1e-12)
         else:
@@ -925,14 +925,14 @@ class DataPlaneHybridRouting:
         records.sort(key=lambda item: (item[0], item[1], item[2]))
 
         tolerance = max(
-            float(self._cfg('data_route_energy_tolerance', 0.0)), 0.0)
+            float(self._cfg('data_route_energy_tolerance', 0.0149334243033)), 0.0)
         stress_tolerance = max(
-            float(self._cfg('data_route_stress_tolerance', 0.0)), 0.0)
+            float(self._cfg('data_route_stress_tolerance', 0.0434899006505)), 0.0)
         distance_stretch = max(
-            float(self._cfg('data_route_distance_stretch', 1.0)), 1.0)
+            float(self._cfg('data_route_distance_stretch', 1.2468301242217)), 1.0)
         hop_slack = max(int(self._cfg('data_route_hop_slack', 0)), 0)
         min_improvement = max(
-            float(self._cfg('data_route_min_improvement', 0.0025)), 0.0)
+            float(self._cfg('data_route_min_improvement', 0.0010234782253)), 0.0)
 
         already_considered = set()
         for _, source, mode, candidate, cand_vec in records:

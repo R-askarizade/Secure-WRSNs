@@ -100,12 +100,15 @@ def _base_config():
         # Strict energy-dominance guards: a DATA route may replace the original
         # route only when projected radio energy and bottleneck stress do not
         # increase.  These are routing parameters, not charger parameters.
+        # Stage-2 optimized defaults (SMAC 2.4 / ParEGO; config 4297d1c15da868f40399).
         'data_route_recompute_period': 5,
-        'data_route_energy_tolerance': 0.0,
-        'data_route_stress_tolerance': 0.0,
-        'data_route_distance_stretch': 1.0,
+        'data_route_energy_tolerance': 0.0149334243033,
+        'data_route_stress_tolerance': 0.0434899006505,
+        'data_route_distance_stretch': 1.2468301242217,
         'data_route_hop_slack': 0,
-        'data_route_min_improvement': 0.0025,
+        'data_route_min_improvement': 0.0010234782253,
+        'data_routing_weight_temperature': 1.5599965406582,
+        'data_routing_weight_floor': 0.0259280212224,
         'data_secondary_k_paths': 24,
         'data_secondary_max_energy_stretch': 1.0,
 
@@ -145,7 +148,7 @@ def _base_config():
         'use_charging_hysteresis': True,
         'minimum_charge_energy_ratio': 0.08,
         'post_charge_release_ratio': 0.88,
-        'charging_reentry_cooldown_s': 180.0,
+        'charging_reentry_cooldown_s': 416.0919820005074,
         'qifl_threshold_lower_bound': 0.20,
         'qifl_threshold_upper_bound': 0.52,
         'qifl_sos_threshold_upper_bound': 0.90,
@@ -169,13 +172,13 @@ def _base_config():
         'plus_pool_max_members_per_cluster': 2,
         'max_rf_cluster_members': 5,
         'max_cluster_stay_time_s': 1.50,
-        'adaptive_request_threshold_hard_cap': 0.68,
+        'adaptive_request_threshold_hard_cap': 0.5640378351323,
         'request_plus_fraction': 0.50,
         'max_service_latency_batches': 6,
         'depletion_rate_safety_factor': 1.20,
         'physical_eps_ewma_beta': 0.70,
         'communication_energy_reserve_ratio': 0.04,
-        'service_latency_safety_margin_s': 75.0,
+        'service_latency_safety_margin_s': 82.6999682188034,
         'use_deadline_safe_energy_sentinel': True,
         'use_universal_mc_feasibility_guard': True,
         'mc_reserve_ratio': 0.05,
@@ -321,6 +324,8 @@ def _scenarios_for_mode(mode):
         'routing': 'routing_suite', 'routing_ablation': 'routing_suite', 'cluster': 'routing_suite',
         'all': 'all_modes', 'full': 'all_modes', 'full_suite': 'all_modes', 'everything': 'all_modes',
         'complete': 'all_modes', 'complete_suite': 'all_modes',
+        'thesis': 'full_thesis', 'thesis_ablation': 'full_thesis',
+        'full_ablation': 'full_thesis', 'full_thesis_ablation': 'full_thesis',
         'sweep': 'parameter_sweep', 'stress': 'parameter_sweep', 'parameter': 'parameter_sweep',
         'article': 'article_scaled', 'paper_energy': 'article_scaled',
         'article_energy': 'article_scaled', 'article_mc': 'article_scaled',
@@ -479,7 +484,7 @@ def _scenarios_for_mode(mode):
             'charging_rate': 5.0,
             'minimum_charge_energy_ratio': 0.08,
             'post_charge_release_ratio': 0.88,
-            'charging_reentry_cooldown_s': 180.0,
+            'charging_reentry_cooldown_s': 416.0919820005074,
             'qifl_threshold_lower_bound': 0.20,
             'qifl_threshold_upper_bound': 0.52,
         })
@@ -501,7 +506,7 @@ def _scenarios_for_mode(mode):
             'use_adaptive_charge_guards': True,
             'minimum_charge_energy_ratio': 0.08,
             'post_charge_release_ratio': 0.88,
-            'charging_reentry_cooldown_s': 180.0,
+            'charging_reentry_cooldown_s': 416.0919820005074,
             'qifl_threshold_lower_bound': 0.20,
             'qifl_threshold_upper_bound': 0.52,
             'qifl_sos_threshold_upper_bound': 0.90,
@@ -672,6 +677,159 @@ def _scenarios_for_mode(mode):
         add('A17_No_Adaptive_Threshold', use_adaptive_edge_threshold=False)
         return ablations
 
+    def get_full_thesis():
+        """Curated thesis ablation suite: each component is evaluated once.
+
+        The suite uses the THREE operating-condition profiles that already
+        exist in the method and does not redefine their numerical condition
+        values:
+
+        * Security condition: ``_base_config()/get_ablation()``
+          (communication/security profile).
+        * Energy-stress condition: the guarded profile already used by
+          ``get_mc_ablation()`` (energy/charging-stress profile).
+        * Real-world condition: the exact ``Article_Scaled_Absolute_Single``
+          profile returned by ``get_article_scaled_single()``.
+
+        Ablation switches are transplanted onto the appropriate condition by
+        applying ONLY the keys that differ from the source suite's own full
+        reference.  Thus the real-world physical/scaled values (stored energy,
+        charger capacity, radio coefficients, movement cost, charging rate,
+        radius, speed and horizon) remain exactly those already defined by the
+        article-scaled scenario.
+
+        Conceptual duplicates are consolidated so the same component-removal
+        experiment is not repeated in more than one condition.
+        """
+        scenarios = []
+
+        def append(prefix, name, cfg):
+            # Prefix only the result label; never mutate the source condition.
+            scenarios.append((f'{prefix}__{name}', dict(cfg)))
+
+        def delta_from_reference(reference, variant):
+            """Return only effective keys changed by an ablation variant."""
+            keys = set(reference) | set(variant)
+            delta = {}
+            for key in keys:
+                ref_has = key in reference
+                var_has = key in variant
+                if not var_has:
+                    # Current source suites do not delete keys; keep this guard
+                    # so no operating-condition key is accidentally removed.
+                    continue
+                if (not ref_has) or variant[key] != reference[key]:
+                    delta[key] = variant[key]
+            return delta
+
+        # Source suites. These remain the single source of truth for their
+        # existing operating-condition and ablation definitions.
+        security_source = {name: cfg for name, cfg in get_ablation()}
+        energy_source = {name: cfg for name, cfg in get_mc_ablation()}
+        routing_source = {name: cfg for name, cfg in get_routing_ablation()}
+        article_name, article_cfg = get_article_scaled_single()[0]
+        article_reference = dict(article_cfg)
+
+        # ===============================================================
+        # CONDITION 1 — SECURITY / COMMUNICATION
+        # One reference + 13 security/detection ablations.
+        # A12..A15 are evaluated under the real-world condition below.
+        # ===============================================================
+        security_names = [
+            'Full_Method',
+            'A01_FCM_Only',
+            'A02_No_FCM',
+            'A03_No_UCR_Risk_Fusion',
+            'A04_No_Risk_History_Hysteresis',
+            'A05_No_WRSN_Hard_Filters',
+            'A06_No_SED',
+            'A07_No_Deviation_MC',
+            'A08_No_Stealth_Filter',
+            'A09_No_Counterfactual_Path_Attribution',
+            'A10_No_Shannon_Entropy_Weights',
+            'A11_No_Security_Veto_FE',
+            'A16_No_Piggyback_Telemetry',
+            'A17_No_Adaptive_Threshold',
+        ]
+        for name in security_names:
+            append('Security', name, security_source[name])
+
+        # ===============================================================
+        # CONDITION 2 — ENERGY STRESS / MOBILE CHARGING
+        # One reference + 10 unique charging/QIFL/DQN/MC-security ablations.
+        # MC_No_SED and MC_No_Deviation_Filter are not repeated because the
+        # same removed mechanisms are already tested by A06/A07 under Security.
+        # MC_Full_Security is identical to MC_Full_QIFL_DQN in this profile.
+        # Optional Multi-MC/count sweeps are not component-removal ablations.
+        # ===============================================================
+        energy_names = [
+            'MC_Full_QIFL_DQN',
+            'MC_No_Fixed_Chargers',
+            'MC_No_RF_MultiNode',
+            'MC_No_Dynamic_Partial',
+            'MC_QIFL_Only',
+            'MC_DQN_Only',
+            'MC_No_QIFL_DQN',
+            'MC_QIFL_DQN_No_Guards',
+            'MC_No_HMAC',
+            'MC_No_Location_Check',
+            'MC_Raw_SOS_No_Validation',
+        ]
+        for name in energy_names:
+            append('EnergyStress', name, energy_source[name])
+
+        # ===============================================================
+        # CONDITION 3 — REAL-WORLD / ARTICLE-SCALED PHYSICAL PROFILE
+        # The reference is EXACTLY Article_Scaled_Absolute_Single.  Routing
+        # and routing/communication ablations are transplanted by applying
+        # only their changed component keys, never the routing-suite condition.
+        # ===============================================================
+        append('RealWorld', article_name, article_reference)
+
+        routing_full = routing_source['Final_Method_MC_Completed']
+        for name in [
+            'Routing_No_FCBE_SoftBalancing',
+            'Routing_No_IFBE_Selection',
+            'Routing_No_AdaptiveWeights',
+            'Routing_No_MST_Backbone',
+            'Routing_Flat_Baseline',
+        ]:
+            changes = delta_from_reference(routing_full, routing_source[name])
+            cfg = dict(article_reference)
+            cfg.update(changes)
+            append('RealWorld', name, cfg)
+
+        security_full = security_source['Full_Method']
+        for name in [
+            'A12_No_Critical_Multipath',
+            'A13_Periodic_Route_Recompute',
+            'A14_Periodic_HELLO_Enabled',
+            'A15_Network_ACK_Enabled',
+        ]:
+            changes = delta_from_reference(security_full, security_source[name])
+            cfg = dict(article_reference)
+            cfg.update(changes)
+            append('RealWorld', name, cfg)
+
+        # ---------------------------------------------------------------
+        # Defensive de-duplication by complete effective configuration.
+        # Three references remain because the three operating profiles are
+        # genuinely different. Any accidental repeated effective configuration
+        # is skipped, guaranteeing one execution per unique design.
+        # ---------------------------------------------------------------
+        unique = []
+        seen = set()
+        for name, cfg in scenarios:
+            fingerprint = json.dumps(cfg, sort_keys=True, default=str,
+                                     separators=(',', ':'))
+            if fingerprint in seen:
+                print(f'[FULL_THESIS] Skipping duplicate configuration: {name}')
+                continue
+            seen.add(fingerprint)
+            unique.append((name, cfg))
+
+        return unique
+
     def get_parameter_sweep():
         out = []
 
@@ -794,6 +952,8 @@ def _scenarios_for_mode(mode):
         return get_energy() + get_mc_ablation()
     if mode == 'routing_suite':
         return get_routing_ablation()
+    if mode == 'full_thesis':
+        return get_full_thesis()
     if mode == 'all_modes':
         return [('Phase1_Method', base)] + get_ablation() + get_energy() + get_mc_ablation() + get_routing_ablation() + _physical_compromise_scenarios()
     if mode in ('parameter_sweep', 'stress_sweep', 'innovation_parameter_sweep'):
@@ -1342,7 +1502,9 @@ def run_statistical_experiments():
         'security_validation': 'security_edge_cases', 'security_edge_validation': 'security_edge_cases',
         'innovation': 'innovation_coverage', 'innovation_audit': 'innovation_coverage',
         'phase1_innovation_audit': 'innovation_coverage', 'innovation_validation': 'innovation_coverage',
-        'routing': 'routing_suite', 'clustering': 'routing_suite', 'routing_ablation': 'routing_suite'
+        'routing': 'routing_suite', 'clustering': 'routing_suite', 'routing_ablation': 'routing_suite',
+        'thesis': 'full_thesis', 'thesis_ablation': 'full_thesis',
+        'full_ablation': 'full_thesis', 'full_thesis_ablation': 'full_thesis'
     }
     normalized_mode = aliases.get(run_mode, run_mode)
 
@@ -1361,34 +1523,95 @@ def run_statistical_experiments():
     safe_mode = ''.join(c if c.isalnum() or c in ('_', '-')
                         else '_' for c in normalized_mode)
 
+    # Long thesis runs can be interrupted.  WRSN_RESUME=1 enables a durable
+    # per-(scenario, seed) checkpoint so already completed simulations are not
+    # repeated.  WRSN_OUTPUT_DIR redirects every result artifact without
+    # modifying any scenario/physics parameter.
+    output_dir = os.path.abspath(os.environ.get('WRSN_OUTPUT_DIR', '.'))
+    os.makedirs(output_dir, exist_ok=True)
+    resume_enabled = _env_enabled('WRSN_RESUME', '0')
+    prefix = f"performance_{safe_mode}"
+    results_path = os.path.join(output_dir, f'{prefix}_results.csv')
+    summary_path = os.path.join(output_dir, f'{prefix}_summary_ci.csv')
+    plots_path = os.path.join(output_dir, f'plots_{prefix}')
+
     print(f"[RUNNER] WRSN_RUN_MODE={normalized_mode}")
+    print(f"[RUNNER] WRSN_RESUME={int(resume_enabled)}")
+    print(f"[RUNNER] WRSN_OUTPUT_DIR={output_dir}")
     print(
         f"[RUNNER] Running {len(scenarios)} scenario(s): {', '.join(scenario_names)}")
 
-    all_results = []
+    existing_df = pd.DataFrame()
+    completed = set()
+    if resume_enabled and os.path.exists(results_path) and os.path.getsize(results_path) > 0:
+        try:
+            existing_df = pd.read_csv(results_path)
+            if {'Ablation_Scenario', 'Seed'}.issubset(existing_df.columns):
+                for _, row in existing_df.iterrows():
+                    try:
+                        completed.add((str(row['Ablation_Scenario']), int(row['Seed'])))
+                    except (TypeError, ValueError):
+                        pass
+            print(f"[RESUME] Loaded {len(existing_df)} saved row(s); "
+                  f"{len(completed)} completed scenario/seed pair(s).")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot resume safely from {results_path}: {exc}") from exc
+
+    # Keep only rows relevant to the current mode's scenarios. This prevents a
+    # stale/manual CSV row from being treated as a valid checkpoint.
+    valid_scenarios = set(scenario_names)
+    if not existing_df.empty and 'Ablation_Scenario' in existing_df.columns:
+        existing_df = existing_df[
+            existing_df['Ablation_Scenario'].astype(str).isin(valid_scenarios)
+        ].copy()
+        completed = {
+            (str(r['Ablation_Scenario']), int(r['Seed']))
+            for _, r in existing_df.iterrows()
+            if pd.notna(r.get('Seed'))
+        }
+
+    all_results = existing_df.to_dict('records') if not existing_df.empty else []
+
+    def save_checkpoint(rows):
+        checkpoint_df = pd.DataFrame(rows)
+        checkpoint_df = _add_charging_efficiency_diagnostics(checkpoint_df)
+        tmp_path = results_path + '.tmp'
+        checkpoint_df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, results_path)
+        return checkpoint_df
+
     for scenario_name, config in scenarios:
         scenario_sim_time = (
             SIM_TIME if sim_time_env is not None else
             int(float(config.get('simulation_time_override_s', SIM_TIME)))
         )
         for seed in range(1, NUM_SEEDS + 1):
+            checkpoint_key = (scenario_name, seed)
+            if resume_enabled and checkpoint_key in completed:
+                print(f"[RESUME] SKIP completed: {scenario_name}, Seed {seed}/{NUM_SEEDS}")
+                continue
+
             print(f"\n{scenario_name}: Seed {seed}/{NUM_SEEDS}; "
                   f"sim_time={scenario_sim_time}s")
             sim = SimulatorManager(
                 num_nodes=NUM_NODES, sim_time=scenario_sim_time,
                 ablation_config=config, seed=seed)
             sim.run_simulation()
-            all_results.append(sim.metrics.export_summary(
-                seed, scenario_name, scenario_sim_time))
+            row = sim.metrics.export_summary(
+                seed, scenario_name, scenario_sim_time)
+            # This is metadata only; it does not alter simulation conditions.
+            row['Simulation_Time_s'] = scenario_sim_time
+            all_results.append(row)
+            completed.add(checkpoint_key)
+            save_checkpoint(all_results)
+            print(f"[CHECKPOINT] Saved {scenario_name}, Seed {seed} -> {results_path}")
 
-    df = pd.DataFrame(all_results)
-    df = _add_charging_efficiency_diagnostics(df)
-    prefix = f"performance_{safe_mode}"
-    df.to_csv(f'{prefix}_results.csv', index=False)
-    summary = summarize_results(df, f'{prefix}_summary_ci.csv')
-    make_plots(df, f'plots_{prefix}')
+    df = save_checkpoint(all_results)
+    summary = summarize_results(df, summary_path)
+    make_plots(df, plots_path)
     print(
-        f"\n[SUCCESS] Saved {prefix}_results.csv, {prefix}_summary_ci.csv, and plots_{prefix}/")
+        f"\n[SUCCESS] Saved {results_path}, {summary_path}, and {plots_path}/")
 
     keep = [c for c in ['Ablation_Scenario', 'N', 'TPR_Mean', 'Accuracy_Mean', 'F1_Score_Mean',
                         'Overall_PDR_Mean', 'Critical_PDR_Mean', 'Throughput_Mean', 'Avg_Delay_Mean',

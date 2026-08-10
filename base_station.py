@@ -193,7 +193,7 @@ class BaseStation:
         self.post_charge_release_ratio = float(
             self.ablation.get('post_charge_release_ratio', 0.88))
         self.charging_reentry_cooldown_s = float(
-            self.ablation.get('charging_reentry_cooldown_s', 180.0))
+            self.ablation.get('charging_reentry_cooldown_s', 416.0919820005074))
         self.qifl_threshold_lower_bound = float(
             self.ablation.get('qifl_threshold_lower_bound', 0.18))
         self.qifl_threshold_upper_bound = float(
@@ -1833,7 +1833,7 @@ class BaseStation:
         charge_time = gap / max(charge_power, 1e-12)
         margin = max(0.0, float(self.ablation.get(
             'service_latency_safety_margin_s',
-            self.ablation.get('hard_deadline_margin_s', 90.0))))
+            82.6999682188034)))
         latency = queue_time + max(0.0, travel_time) + charge_time + margin
         state['estimated_service_latency_s'] = float(latency)
         state['estimated_queue_wait_s'] = float(queue_time)
@@ -1995,7 +1995,7 @@ class BaseStation:
                         sos_energy) / max(E0, 1e-12)
 
         hard_cap = float(np.clip(self.ablation.get(
-            'adaptive_request_threshold_hard_cap', 0.68),
+            'adaptive_request_threshold_hard_cap', 0.5640378351323),
             self.qifl_threshold_lower_bound, 1.0))
         bounded_rt_min = min(float(rt_min_ratio), hard_cap)
         threshold = float(np.clip(

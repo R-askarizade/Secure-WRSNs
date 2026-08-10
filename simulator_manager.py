@@ -95,9 +95,9 @@ class SimulatorManager:
             'Critical_Failover_Reserve_Margin_Ratio': float(
                 self.ablation.get('critical_failover_reserve_margin_ratio', 0.05)),
             'Data_Route_Energy_Tolerance': float(
-                self.ablation.get('data_route_energy_tolerance', 0.0)),
+                self.ablation.get('data_route_energy_tolerance', 0.0149334243033)),
             'Data_Route_Stress_Tolerance': float(
-                self.ablation.get('data_route_stress_tolerance', 0.0)),
+                self.ablation.get('data_route_stress_tolerance', 0.0434899006505)),
             'Article_Energy_Profile_Enabled_Flag': bool(
                 self.ablation.get('article_energy_profile_enabled', False)),
             'Article_Single_Scenario_Flag': bool(
