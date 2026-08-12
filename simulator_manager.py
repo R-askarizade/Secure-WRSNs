@@ -2580,6 +2580,22 @@ class SimulatorManager:
             else remediation_time + rehabilitation_delay
         )
 
+        # Passive scheduler-stall observer.  It has no effect on normal runs.
+        # Recovery is armed only after the *same* zero-time MC event signature
+        # repeats an abnormally large number of times at one simulation
+        # timestamp.  The high default threshold intentionally leaves short,
+        # self-resolving zero-time bursts exactly as they behaved before.
+        stall_guard_last_signature = None
+        stall_guard_repeat_count = 0
+        stall_guard_confirmed = False
+        stall_guard_initial_threshold = max(64, int(self.ablation.get(
+            'scheduler_stall_guard_repeat_threshold', 1024)))
+        # This smaller threshold is used only *after* a real stall has already
+        # been confirmed once in the current simulation.  Therefore it cannot
+        # affect any pre-stall result.
+        stall_guard_post_confirmation_threshold = max(2, int(self.ablation.get(
+            'scheduler_stall_guard_post_confirmation_threshold', 4)))
+
         while self.current_time < self.sim_time - 1e-12:
             next_mc_time = self._next_charger_event_time()
             next_tpm_time = (
@@ -2601,6 +2617,51 @@ class SimulatorManager:
                 float(next_rehabilitation_time), float(self.sim_time))
             if not math.isfinite(next_time):
                 break
+
+            # Build an observer-only signature for MC events that are due at
+            # the current timestamp with no forward time progress.  Mission ID
+            # is deliberately excluded because a pathological redispatch gets
+            # a new ID every iteration; target/phase/charger must remain the
+            # same for the stall counter to grow.
+            due_mc_signature = tuple(sorted(
+                (
+                    str(mc_id),
+                    tuple(mission.get('target_ids', ())),
+                    str(mission.get('phase', '')),
+                    float(mission.get('next_event_time', math.inf)),
+                )
+                for mc_id, mission in self.active_charger_missions.items()
+                if float(mission.get('next_event_time', math.inf))
+                <= float(self.current_time) + 1e-15
+            ))
+            mc_zero_time_now = (
+                bool(due_mc_signature)
+                and float(next_mc_time) <= float(self.current_time) + 1e-15
+                and float(next_time) <= float(self.current_time) + 1e-15
+            )
+            current_stall_signature = (
+                float(self.current_time), due_mc_signature
+            ) if mc_zero_time_now else None
+
+            if (current_stall_signature is not None
+                    and current_stall_signature == stall_guard_last_signature):
+                stall_guard_repeat_count += 1
+            elif current_stall_signature is not None:
+                stall_guard_last_signature = current_stall_signature
+                stall_guard_repeat_count = 1
+            else:
+                stall_guard_last_signature = None
+                stall_guard_repeat_count = 0
+
+            stall_guard_active_threshold = (
+                stall_guard_post_confirmation_threshold
+                if stall_guard_confirmed
+                else stall_guard_initial_threshold
+            )
+            stall_guard_recover_now = (
+                current_stall_signature is not None
+                and stall_guard_repeat_count >= stall_guard_active_threshold
+            )
 
             self._advance_continuous_energy(next_time)
             self.current_time = float(next_time)
@@ -2699,7 +2760,24 @@ class SimulatorManager:
                     _trace_control_packet(node_id, control_packet)
 
             if self.energy_experiment_active:
-                self.service_mobile_charger()
+                if stall_guard_recover_now:
+                    # Emergency one-shot recovery.  Only after the same MC
+                    # zero-time event has repeated >= threshold times do we
+                    # suppress *one* immediate redispatch at that timestamp.
+                    # Pending requests/queues are not deleted; they are
+                    # reconsidered normally at the next genuine simulation
+                    # event.  If this branch is never reached, behavior and
+                    # results follow the original code path exactly.
+                    print(
+                        f"[STALL-GUARD] Confirmed repeated zero-time MC loop at "
+                        f"t={self.current_time:.12f}s after "
+                        f"{stall_guard_repeat_count} identical iterations; "
+                        "suppressing one same-timestamp redispatch.")
+                    stall_guard_confirmed = True
+                    stall_guard_last_signature = None
+                    stall_guard_repeat_count = 0
+                else:
+                    self.service_mobile_charger()
 
         self.metrics.mc_async_missions_incomplete += len(
             self.active_charger_missions)
