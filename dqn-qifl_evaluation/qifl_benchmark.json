@@ -1,11 +1,11 @@
 {
   "samples": 10000,
   "device": "cpu",
-  "batch_vectorized_seconds": 0.23117730001104064,
-  "scalar_vectorized_seconds": 1.3045407999888994,
-  "classic_loop_seconds": 0.8806366999924649,
-  "classic_over_batch_speed_ratio": 3.8093562817387654,
-  "classic_over_scalar_speed_ratio": 0.6750549312064126,
+  "batch_vectorized_seconds": 0.27067739999620244,
+  "scalar_vectorized_seconds": 1.3205434000119567,
+  "classic_loop_seconds": 0.8470918000093661,
+  "classic_over_batch_speed_ratio": 3.1295254055981427,
+  "classic_over_scalar_speed_ratio": 0.6414721394251005,
   "max_absolute_batch_output_difference": 6.072567509951554e-08,
   "max_absolute_scalar_output_difference": 6.288311366065003e-08,
   "claim_scope": "classical vectorization benchmark; not evidence of quantum speedup"

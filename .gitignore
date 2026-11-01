@@ -9,3 +9,11 @@ __pycache__/
 stage2_results/*
 results_dqn_test/*
 thesis_results/*
+baseline_tests/*
+baselines/*
+scallibilty results/*
+run_scripts/*
+realworld_common_baseline_results/*
+realworld_article_1mc_vs_3mc_results/*
+realworld_no_dynamicselection_13mc_conditions_results/*
+/ALL.ipynb
